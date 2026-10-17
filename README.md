@@ -1,69 +1,116 @@
-# Custom Implementation for Whisper-V3-large for TPUv6e 
+# Whisper JAX for Google Cloud TPU (v6e & v7x)
 
-This implementation is based on the original [sanchit-gandhi/whisper-jax](https://github.com/sanchit-gandhi/whisper-jax) repository, optimized for **TPU-v6e** with the latest **JAX packages** and the **whisper-v3-large** model family.
-For more details on the implementation also read https://medium.com/@engineerbharath/unlocking-supersonic-speech-recognition-a-deep-dive-into-optimizing-whisper-on-tpus-6b8d734993d9
-## Supported Models
-We have extensively tested and benchmarked the following models:
-*   **`openai/whisper-large-v3`**: The standard SOTA model.
-*   **`openai/whisper-large-v3-turbo`**: A highly optimized version (4 decoder layers) that delivers ~2x throughput.
-    *   *Note:* Native Flax weights are not available for the Turbo model. This repository automatically handles the on-the-fly conversion of PyTorch weights to Flax during initialization.
+This implementation is based on the original [sanchit-gandhi/whisper-jax](https://github.com/sanchit-gandhi/whisper-jax) repository, optimized for **Google Cloud TPU v6e and v7x** with custom Pallas Flash Attention kernels, a fused multi-stage XLA Mega-Decoder, and configurable CPU/TPU Mel-spectrogram preprocessing.
 
-## Optimized Pipelines
-This repository provides three distinct pipeline architectures, each tailored for a specific use case:
-
-### 1. Standard Batch Pipeline (`pipeline.py`)
-*   **Use Case:** Offline benchmarking of short audio clips (<30s).
-*   **Logic:** High-throughput batch processing using `jax.pmap`. Ideal for maximizing TPU saturation with pre-loaded lists of files.
-*   **Usage:** See `benchmarks/libri-short.py`.
-
-### 2. Long Audio Pipeline (`pipeline_long_audio.py`)
-*   **Use Case:** Offline transcription of long files (e.g., 1 hour+).
-*   **Logic:** Implements chunking with configurable overlap (stride) and timestamp alignment. It ensures context is preserved across 30s boundaries for high accuracy.
-*   **Usage:** See `benchmarks/libri-long.py`.
-
-### 3. Online Serving Pipeline (`pipeline_online.py`)
-*   **Use Case:** Production API serving (FastAPI).
-*   **Logic:** A sophisticated asynchronous engine featuring:
-    *   **ProcessPoolExecutor:** Offloads CPU-heavy FFmpeg decoding to bypass the GIL.
-    *   **Patient Batcher:** Dynamically groups incoming requests into optimal batches (4, 40, 80) with a configurable timeout.
-    *   **TPU Offload:** Feature extraction (Spectrogram) runs on the TPU.
-    *   **Low Latency:** Designed for real-time streaming applications.
+For additional background on the original implementation, see:
+https://medium.com/@engineerbharath/unlocking-supersonic-speech-recognition-a-deep-dive-into-optimizing-whisper-on-tpus-6b8d734993d9
 
 ---
 
-## **1. Infrastructure Setup (Local Machine)**
+## Supported Models
 
-These steps provision the necessary Google Cloud infrastructure. Run these commands from your local terminal.
+* **`openai/whisper-large-v3`**: Full 32-encoder-layer, 32-decoder-layer model.
+* **`openai/whisper-large-v3-turbo`**: 32-encoder-layer, 4-decoder-layer model.
+  * *Note:* Native Flax weights are not published for `whisper-large-v3-turbo`; this repository automatically converts PyTorch weights to Flax on initialization.
 
-### **1.1 Set Project Details** Replace with your environemnt  details 
+---
 
+## Repository Structure
+
+The package follows a modular layout under `whisper_jax/`:
+
+```text
+whisper_jax/
+├── config/          # Model & pipeline configuration classes (configuration_whisper.py)
+├── entrypoints/     # End-to-end pipelines (pipeline.py, pipeline_long_audio.py, pipeline_online.py)
+├── kernels/         # Custom TPU Pallas kernels (FlyWheel Flash Attention, Tokamax Splash & RPA wrappers)
+├── layers/          # Neural network building blocks (conv.py, norms.py)
+├── models/          # Flax Whisper encoder/decoder & fused multi-stage Mega-Decoder (whisper.py)
+├── preprocessing/   # Audio loading, FFmpeg decoding, and Mel filterbank extraction (audio.py)
+└── utils/           # Partitioning and state utilities (partitioner.py, train_state.py)
 ```
+
+ Top-level module paths (`whisper_jax.pipeline`, `whisper_jax.pipeline_long_audio`, `whisper_jax.pipeline_online`, `whisper_jax.modeling_flax_whisper`) are re-exported for backward compatibility.
+
+---
+
+## Pipeline Architectures
+
+### 1. Standard Batch Pipeline (`whisper_jax/entrypoints/pipeline.py`)
+* **Use Case:** Offline batch transcription of short audio clips (<30s).
+* **Logic:** Data-parallel (`jax.pmap`) execution with bucketed batch padding and persistent ring-buffer staging.
+* **Entrypoint:** `benchmarks/libri-short.py`.
+
+### 2. Long Audio Pipeline (`whisper_jax/entrypoints/pipeline_long_audio.py`)
+* **Use Case:** Offline transcription of long-form audio files.
+* **Logic:** Splits long audio into overlapping 30s chunks (`chunk_length_s`, `stride_length_s`), dispatches batches across TPU cores, and merges chunk transcriptions.
+* **Entrypoint:** `benchmarks/libri-long.py`.
+
+### 3. Online Serving Pipeline (`whisper_jax/entrypoints/pipeline_online.py`)
+* **Use Case:** Production HTTP API serving (FastAPI).
+* **Logic:** Asynchronous request handling with background audio decoding and dynamic patient batching (`batch_buckets: [4, 40, 80]`).
+* **Entrypoint:** `server/main.py` and `benchmarks/test_api_smart.py`.
+
+---
+
+## Kernel & Backend Configuration (`config.yml`)
+
+All pipelines read their runtime settings from `config.yml` (and accept overrides via constructor arguments):
+
+```yaml
+common:
+  dtype: "bfloat16"
+
+  # Encoder self-attention implementation:
+  # - "flywheel": FlyWheel Pallas token-major Flash Attention with paired d=64 head DMAs (default)
+  # - "splash":   Tokamax Pallas Splash Attention
+  # - "original": Standard XLA dot-product attention
+  encoder_attention_implementation: "flywheel"
+
+  # Decoder attention implementation:
+  # - "original" (or "mega"): Fused XLA nested 3-stage (64 -> 128 -> 512) KV-cache Mega-Decoder (default)
+  # - "flywheel":             FlyWheel Pallas contiguous KV-cache decode attention
+  # - "flywheel_paged":       FlyWheel Pallas paged KV-cache decode attention
+  # - "rpa":                  Tokamax Ragged Paged Attention v3
+  decoder_attention_implementation: "original"
+
+  # Mel-spectrogram feature extraction backend:
+  # - "cpu": Native C/Rust FFmpeg + Slaney Mel filterbank on host CPU, transferring bfloat16 (B, 3000, 128) features (default)
+  # - "tpu": Raw float32 waveform transfer to TPU with in-graph STFT + Mel extraction
+  feature_extraction_backend: "cpu"
+```
+
+Hardware-specific Pallas tile sizes (`block_q`, `block_kv`) are selected automatically at runtime based on the detected TPU device kind (`TPU v6e` vs `TPU v7x`).
+
+---
+
+## 1. Infrastructure Setup (Local Machine)
+
+Run these commands from your local machine to provision a Cloud TPU VM.
+
+### 1.1 Set Environment Variables
+
+```bash
 export TPU_NAME=TPU-testing
 export PROJECT_ID=tpu-launchpad-playground
 export REGION=us-central1
 export ZONE=us-central1-b
-
 ```
 
-### **1.2 Create TPU VM**
+### 1.2 Create TPU VM
 
-This command provisions a `2x4` TPU v6e slice.
-
-```
+```bash
 gcloud alpha compute tpus tpu-vm create $TPU_NAME \
   --type v6e --topology 2x4 \
   --project $PROJECT_ID --zone $ZONE \
   --version v2-alpha-tpuv6e --tags=allow-iap-ssh
-
 ```
 
-### **1.3 Configure Firewall for SSH \-optional for TPU-Playground**
+### 1.3 Configure Firewall for IAP SSH (Optional)
 
-This rule is specific to the playground project to allow IAP access.
-
-```
+```bash
 gcloud compute firewall-rules create allow-iap-on-tagged-vms-high-priority \
-  --project=tpu-launchpad-playground \
+  --project=$PROJECT_ID \
   --description="High-priority allow for IAP on tagged VMs" \
   --direction=INGRESS \
   --priority=900 \
@@ -72,145 +119,96 @@ gcloud compute firewall-rules create allow-iap-on-tagged-vms-high-priority \
   --rules=tcp:22 \
   --source-ranges=35.235.240.0/20 \
   --target-tags=allow-iap-ssh
-
 ```
 
-### **1.4 SSH into the Machine**
-
-Connect to the TPU VM. All subsequent commands will be run inside this machine.
-
-```
-gcloud alpha compute tpus tpu-vm ssh --zone $ZONE $TPU_NAME --project $PROJECT_ID --tunnel-through-iap
-
-```
-
-## **2. Software Installation & Configuration (Inside TPU VM)**
-
-Execute the following steps inside your TPU VM\'s terminal.
-
-### **2.1 Install System Tools**
-
-```
-# Install tpu-info & verify setup
-pip install tpu-info
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-tpu-info
-
-# Install git
-sudo apt-get update && sudo apt-get install git -y
-
-```
-
-### **2.2 Clone the Repository**
-
-Please configure your github credentials on this machine to clone the repo. Use the account on which the access has been granted. 
-
-```
-git clone https://github.com/engineerbharath12/whisper-on-jax.git
-
-```
-
-### **2.3 Install Python Dependencies**
-
-The installation process is now streamlined. All required packages and their correct versions are pinned in the `setup.py` file.
+### 1.4 SSH into the TPU VM
 
 ```bash
-# 1. Install the correct JAX version for TPUs
-# This step is crucial as it installs the TPU-specific libraries from Google\'s repository.
+gcloud alpha compute tpus tpu-vm ssh --zone $ZONE $TPU_NAME --project $PROJECT_ID --tunnel-through-iap
+```
+
+---
+
+## 2. Software Installation (Inside TPU VM)
+
+### 2.1 Install System Dependencies
+
+```bash
+sudo apt-get update && sudo apt-get install -y git ffmpeg
+sudo sh -c "echo always > /sys/kernel/mm/transparent_hugepage/enabled"
+
+pip install tpu-info
+export PATH="$HOME/.local/bin:$PATH"
+tpu-info
+```
+
+### 2.2 Clone the Repository
+
+```bash
+git clone https://github.com/hks-9697-v2/whisper-tpu-google.git
+cd whisper-tpu-google
+```
+
+### 2.3 Install Python Dependencies
+
+```bash
+# 1. Install JAX for TPU
 pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 
-# 2. Navigate into the project directory
-cd whisper-jax-google/
-
-# 3. Upgrade pip (recommended)
-python3.11 -m pip install --upgrade pip
-
-# 4. Install the project and all dependencies
-# This single command will install torch, transformers, librosa, etc., at their tested versions.
+# 2. Upgrade pip and install the package in editable mode
+python3 -m pip install --upgrade pip
 pip install -e .
 ```
 
-### **2.4 System & Audio Tools**
+---
 
+## 3. Running the Benchmarks
+
+### 3.1 Configure Audio Speed-Up (Optional)
+
+In `config.yml`, `common.speed_factor` controls optional FFmpeg `atempo` audio speed-up prior to transcription:
+
+```yaml
+common:
+  speed_factor: 1.0  # Set to 1.0 for original audio speed, or e.g. 2.2 for sped-up audio
 ```
-# Recommended kernel memory setting
-sudo sh -c "echo always > /sys/kernel/mm/transparent_hugepage/enabled"
 
-# Install ffmpeg for audio conversion
-sudo apt install ffmpeg -y
+### 3.2 Short Audio Benchmark (`benchmarks/libri-short.py`)
 
-```
-
-## **3. Running the Benchmark**
-
-This project uses a central `config.yml` file to manage key parameters for the transcription pipelines, such as `dtype`, `batch_size`, attention implementation, and chunking strategy.
-
-### **3.1 Optimizing Throughput with Audio Speed-Up**
-
-A key feature of this repository is the ability to speed up audio during pre-processing (using FFmpeg) to increase throughput.
-
-*   **Mechanism:** Audio is sped up (e.g., 2.2x), transcribed, and timestamps are adjusted.
-*   **Configuration:** Controlled via `config.yml`:
-    ```yaml
-    common:
-      speed_factor: 2.2  # Default recommended value
-    ```
-*   **Recommendation:** Extensive benchmarking has shown that **2.2x** is the optimal speed factor. It delivers a significant boost in RTFx (~40% for Turbo) while maintaining 100% transcription accuracy.
-    *   **2.2x:** High performance, perfect accuracy.
-    *   **2.5x:** Higher performance, minor artifacts.
-    *   **3.0x:** Not recommended (hallucinations on short segments).
-
-### **3.2 Running the Short Audio Benchmark**
-
-For short audio files (under 30 seconds), use the `libri-short.py` script. The script automatically picks up the `speed_factor` from `config.yml`.
-
-You can specify the model to benchmark by passing the `--model_id` argument:
+Use `benchmarks/libri-short.py` for short audio clips (<30 seconds):
 
 ```bash
-# Run with the default model (openai/whisper-large-v3)
-python3.11 benchmarks/libri-short.py
+# Run with default model (openai/whisper-large-v3)
+python3 benchmarks/libri-short.py
 
-# Run with a different model, e.g., the turbo version
-python3.11 benchmarks/libri-short.py --model_id "openai/whisper-large-v3-turbo"
+# Run with openai/whisper-large-v3-turbo
+python3 benchmarks/libri-short.py --model_id "openai/whisper-large-v3-turbo"
 ```
 
-### **3.3 Running the Long Audio Benchmark**
+### 3.3 Long Audio Benchmark (`benchmarks/libri-long.py`)
 
-For long audio files, use the `libri-long.py` script. This script is optimized for long-form transcription and will process the audio in chunks. It also respects the `speed_factor` in `config.yml`.
-
-You can also specify the model for the long audio benchmark:
+Use `benchmarks/libri-long.py` for long-form chunked audio transcription:
 
 ```bash
-# Run with the default model
-python3.11 benchmarks/libri-long.py
+# Run with default model (openai/whisper-large-v3)
+python3 benchmarks/libri-long.py
 
-# Run with the turbo model
-python3.11 benchmarks/libri-long.py --model_id "openai/whisper-large-v3-turbo"
+# Run with openai/whisper-large-v3-turbo
+python3 benchmarks/libri-long.py --model_id "openai/whisper-large-v3-turbo"
 ```
 
-### **3.4 Running the Online Server Benchmark**
+### 3.4 Online Server Benchmark
 
-For production scenarios, you should benchmark the Online Serving Pipeline (`pipeline_online.py`), which simulates a real-world load with concurrent HTTP requests.
+1. **Start the FastAPI Server:**
+   ```bash
+   cd server/
+   python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
+   ```
+   Wait until the server completes warmup and logs `Application startup complete`.
 
-**1. Start the Server:**
-```bash
-cd server/
-python3.11 -m uvicorn main:app --host 0.0.0.0 --port 8000
-```
-*Wait for the logs to show "Application startup complete" (this includes JIT compilation).*
-
-**2. Run the "Smart" Benchmark Client:**
-Open a new terminal window and run:
-```bash
-# Benchmark with 1280 concurrent requests
-python3.11 benchmarks/test_api_smart.py -n 1280 -c 1280
-```
-*   `-n`: Total number of requests.
-*   `-c`: Concurrency level (simultaneous clients).
-
-### **3.5 Analyze Results**
-
-For all scripts, the benchmark will first perform a one-time JIT compilation, which can take several minutes. After compilation, it will execute the transcription and print a final summary table with the performance metrics, including the Real-Time Factor (RTFx).
-
-```
+2. **Run the Benchmark Client:**
+   ```bash
+   python3 benchmarks/test_api_smart.py -n 1280 -c 1280
+   ```
+   * `-n`: Total number of requests.
+   * `-c`: Concurrency level (simultaneous client workers).

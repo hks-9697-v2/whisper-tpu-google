@@ -1642,7 +1642,9 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         head_dim = self.config.d_model // num_heads
         cache_len = ((max_length + 127) // 128) * 128
         stage1_limit = min(64, max_length)
-        stage1_cache_len = 64 if max_length <= 64 else 64
+        stage1_cache_len = 64
+        stage2_limit = min(128, max_length)
+        stage2_cache_len = 128
 
         cross_k, cross_v = [], []
         for i in range(num_layers):
@@ -1734,15 +1736,51 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         if max_length <= stage1_limit:
             return s_T1.T
 
-        cond2, body2 = make_step_fns(max_length, cache_len)
+        if stage2_limit >= max_length or stage2_cache_len == cache_len:
+            cond2, body2 = make_step_fns(max_length, cache_len)
+
+            def run_stage2_only(state1):
+                c_len, s_t, r_tok, fin, k1, v1 = state1
+                pad_len = cache_len - stage1_cache_len
+                k2 = [jnp.pad(k, ((0, pad_len), (0, 0), (0, 0), (0, 0))) for k in k1]
+                v2 = [jnp.pad(v, ((0, pad_len), (0, 0), (0, 0), (0, 0))) for v in v1]
+                _, final_s_t, _, _, _, _ = lax.while_loop(cond2, body2, (c_len, s_t, r_tok, fin, k2, v2))
+                return final_s_t
+
+            final_s_T = lax.cond(
+                jnp.logical_and(cur_len1 < max_length, ~jnp.all(is_fin1)),
+                run_stage2_only,
+                lambda state1: state1[1],
+                (cur_len1, s_T1, run_tok1, is_fin1, kc1, vc1),
+            )
+            return final_s_T.T
+
+        cond2, body2 = make_step_fns(stage2_limit, stage2_cache_len)
+        cond3, body3 = make_step_fns(max_length, cache_len)
 
         def run_stage2(state1):
             c_len, s_t, r_tok, fin, k1, v1 = state1
-            pad_len = cache_len - stage1_cache_len
-            k2 = [jnp.pad(k, ((0, pad_len), (0, 0), (0, 0), (0, 0))) for k in k1]
-            v2 = [jnp.pad(v, ((0, pad_len), (0, 0), (0, 0), (0, 0))) for v in v1]
-            _, final_s_t, _, _, _, _ = lax.while_loop(cond2, body2, (c_len, s_t, r_tok, fin, k2, v2))
-            return final_s_t
+            pad_len2 = stage2_cache_len - stage1_cache_len
+            k2 = [jnp.pad(k, ((0, pad_len2), (0, 0), (0, 0), (0, 0))) for k in k1]
+            v2 = [jnp.pad(v, ((0, pad_len2), (0, 0), (0, 0), (0, 0))) for v in v1]
+            c_len2, s_t2, r_tok2, fin2, k2_out, v2_out = lax.while_loop(
+                cond2, body2, (c_len, s_t, r_tok, fin, k2, v2)
+            )
+
+            def run_stage3(state2):
+                cl2, st2, rt2, fn2, k_2, v_2 = state2
+                pad_len3 = cache_len - stage2_cache_len
+                k3 = [jnp.pad(k, ((0, pad_len3), (0, 0), (0, 0), (0, 0))) for k in k_2]
+                v3 = [jnp.pad(v, ((0, pad_len3), (0, 0), (0, 0), (0, 0))) for v in v_2]
+                _, final_s_t, _, _, _, _ = lax.while_loop(cond3, body3, (cl2, st2, rt2, fn2, k3, v3))
+                return final_s_t
+
+            return lax.cond(
+                jnp.logical_and(c_len2 < max_length, ~jnp.all(fin2)),
+                run_stage3,
+                lambda state2: state2[1],
+                (c_len2, s_t2, r_tok2, fin2, k2_out, v2_out),
+            )
 
         final_s_T = lax.cond(
             jnp.logical_and(cur_len1 < max_length, ~jnp.all(is_fin1)),

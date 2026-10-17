@@ -15,7 +15,7 @@ common:
   # --- Attention Mechanism ---
   # Description: The self-attention implementation to use in the model's encoder and decoder.
   # Encoder Options: "flywheel" (FlyWheel Pallas Flash Attention - fastest), "splash" (Tokamax Splash Attention), "original" (XLA standard).
-  # Decoder Options: "original" / "mega" (XLA fused 2-stage KV cache - fastest), "flywheel" (FlyWheel Pallas contiguous KV-cache), "flywheel_paged" (FlyWheel Pallas paged KV-cache), "rpa" (Tokamax Ragged Paged Attention v3).
+  # Decoder Options: "original" / "mega" (XLA fused nested 3-stage KV cache - fastest), "flywheel" (FlyWheel Pallas contiguous KV-cache), "flywheel_paged" (FlyWheel Pallas paged KV-cache), "rpa" (Tokamax Ragged Paged Attention v3).
   # Impact: "flywheel" and "splash" use hardware-tuned Pallas block sizes automatically selected per TPU generation (v7x vs v6e).
   encoder_attention_implementation: "flywheel"
   decoder_attention_implementation: "original"
