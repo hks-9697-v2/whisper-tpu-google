@@ -15,13 +15,30 @@ from concurrent.futures import Future, ThreadPoolExecutor, ProcessPoolExecutor
 from flax import jax_utils
 from flax.core.frozen_dict import freeze
 from flax.training.common_utils import shard
+from huggingface_hub import list_repo_files
 from transformers import WhisperProcessor, WhisperConfig, WhisperTokenizerFast, WhisperTokenizer, is_tokenizers_available
 from transformers.models.whisper.tokenization_whisper import TO_LANGUAGE_CODE
 from transformers.utils import logging
 
 # Local imports
 from ..models.whisper import FlaxWhisperForConditionalGeneration
-from ..inputs.audio_loader import get_rust_lib, decode_audio_bytes_rs, fill_padded_batch_rs
+from ..inputs.audio_loader import (
+    configure_mel_tables_rs,
+    decode_audio_bytes_rs,
+    decode_audio_bytes_with_mel_rs,
+    fill_mel_batch_bf16_rs,
+    fill_padded_batch_rs,
+    get_rust_lib,
+    preallocate_batch_buffers_rs,
+)
+
+
+def _flax_weights_exist(checkpoint):
+    try:
+        files = list_repo_files(checkpoint)
+        return "flax_model.msgpack" in files
+    except Exception:
+        return False
 
 _HANNING_WINDOW_400 = np.hanning(400).astype(np.float32)
 _MEL_FILTERBANK_CACHE = {}
@@ -88,7 +105,11 @@ class FlaxWhisperOnlinePipeline:
         self.device_count = jax.local_device_count()
         logger.info(f"Detected {self.device_count} JAX devices.")
         
-        self.batch_buckets = common_config.get("batch_buckets", [4, 40, 80])
+        raw_buckets = common_config.get("batch_buckets", [4, 40, 80])
+        self.batch_buckets = sorted(list(dict.fromkeys(
+            max(b, self.device_count) if b % self.device_count != 0 else b
+            for b in raw_buckets
+        )))
         self.max_batch_size = self.batch_buckets[-1]
             
         logger.info(f"Batch Buckets: {self.batch_buckets}")
@@ -101,13 +122,24 @@ class FlaxWhisperOnlinePipeline:
         self.tokenizer = tokenizer_cls.from_pretrained(checkpoint)
 
         if "use_tpu_features" in kwargs and kwargs["use_tpu_features"] is not None:
-            self.use_tpu_features = bool(kwargs.pop("use_tpu_features"))
+            requested_tpu = bool(kwargs.pop("use_tpu_features"))
+        elif "use_cpu_mel" in kwargs and kwargs["use_cpu_mel"] is not None:
+            requested_tpu = not bool(kwargs.pop("use_cpu_mel"))
         elif "feature_extraction_backend" in kwargs and kwargs["feature_extraction_backend"] is not None:
-            self.use_tpu_features = str(kwargs.pop("feature_extraction_backend")).lower() == "tpu"
+            requested_tpu = str(kwargs.pop("feature_extraction_backend")).lower() == "tpu"
         else:
-            backend = common_config.get("feature_extraction_backend", "tpu")
-            self.use_tpu_features = common_config.get("use_tpu_features", str(backend).lower() == "tpu")
-        logger.info(f"--- Feature Extraction Method: {'TPU-based' if self.use_tpu_features else 'CPU-based'} ---")
+            backend = common_config.get("feature_extraction_backend", "cpu")
+            requested_tpu = common_config.get("use_tpu_features", str(backend).lower() == "tpu")
+
+        self._use_cpu_mel_bf16 = (
+            not requested_tpu
+            and self.feature_extractor.sampling_rate == 16000
+            and self.feature_extractor.n_fft == 400
+            and self.feature_extractor.feature_size in (80, 128)
+        )
+        self.use_tpu_features = requested_tpu or not self._use_cpu_mel_bf16
+        self.feature_extraction_backend = "tpu" if self.use_tpu_features else "cpu"
+        logger.info(f"--- Feature Extraction Method: {'TPU-based' if self.use_tpu_features else 'CPU-based (C RFFT + bfloat16 NHC)'} ---")
         
         # NEW: Read Speed Factor from Config
         self.speed_factor = common_config.get("speed_factor", 1.0)
@@ -123,30 +155,47 @@ class FlaxWhisperOnlinePipeline:
         )
         logger.info(f"Attention: Encoder='{encoder_attn}', Decoder='{decoder_attn}'")
 
-        model_load_result = FlaxWhisperForConditionalGeneration.from_pretrained(
-            self.checkpoint, 
-            dtype=self.dtype, 
-            encoder_attention_implementation=encoder_attn,
-            decoder_attention_implementation=decoder_attn,
-            **kwargs
-        )
-        
-        if isinstance(model_load_result, tuple):
-            self.model = model_load_result[0]
-            loaded_params = model_load_result[1]
-        else:
-            self.model = model_load_result
+        has_flax_weights = _flax_weights_exist(self.checkpoint)
+        if not has_flax_weights:
+            self.model = FlaxWhisperForConditionalGeneration.from_pretrained(
+                self.checkpoint,
+                dtype=self.dtype,
+                from_pt=True,
+                encoder_attention_implementation=encoder_attn,
+                decoder_attention_implementation=decoder_attn,
+                **kwargs,
+            )
             loaded_params = self.model.params
+        else:
+            self.model, loaded_params = FlaxWhisperForConditionalGeneration.from_pretrained(
+                self.checkpoint,
+                dtype=self.dtype,
+                _do_init=False,
+                encoder_attention_implementation=encoder_attn,
+                decoder_attention_implementation=decoder_attn,
+                **kwargs,
+            )
         
         for key, value in generation_config_values.items():
             if hasattr(self.model.generation_config, key):
                 setattr(self.model.generation_config, key, value)
 
         get_rust_lib()
+        if self._use_cpu_mel_bf16:
+            configure_mel_tables_rs(
+                n_mels=self.feature_extractor.feature_size,
+                sr=self.feature_extractor.sampling_rate,
+                n_fft=self.feature_extractor.n_fft,
+            )
         _get_mel_filterbank_T(
             self.feature_extractor.sampling_rate,
             self.feature_extractor.n_fft,
             self.feature_extractor.feature_size,
+        )
+        preallocate_batch_buffers_rs(
+            self.batch_buckets,
+            30 * self.feature_extractor.sampling_rate,
+            use_mel_bf16=self._use_cpu_mel_bf16,
         )
         loaded_params = FlaxWhisperForConditionalGeneration.prepare_fast_params(
             loaded_params, self.config, dtype=self.dtype, generation_config=self.model.generation_config
@@ -179,16 +228,24 @@ class FlaxWhisperOnlinePipeline:
         # Warm-up
         logger.info(f"Warming up JIT kernels for buckets: {self.batch_buckets}...")
         dummy_audio_len = int(30 * 16000)
-        warmup_configs = [
-            {"language": None, "task": "transcribe"}, 
-            {"language": "en", "task": "transcribe"}
-        ]
+        if getattr(self.model.generation_config, "lang_to_id", None) is not None:
+            warmup_configs = [
+                {"language": None, "task": "transcribe"},
+                {"language": "en", "task": "transcribe"},
+            ]
+        else:
+            warmup_configs = [
+                {"language": None, "task": "transcribe"},
+            ]
 
         for b_size in self.batch_buckets:
             for w_conf in warmup_configs:
                 logger.info(f"   ...warming up batch size {b_size} | lang={w_conf['language']}")
-                dummy_batch_audio = np.zeros((b_size, dummy_audio_len), dtype=np.float32)
-                dummy_mask = np.ones((b_size, 3000), dtype=np.int32)
+                if self._use_cpu_mel_bf16:
+                    dummy_batch_audio = np.zeros((b_size, 3000, 128), dtype=np.uint16).view(jnp.bfloat16)
+                else:
+                    dummy_batch_audio = np.zeros((b_size, dummy_audio_len), dtype=np.float32)
+                dummy_mask = None
                 forced_ids = self.get_forced_decoder_ids(task=w_conf["task"], language=w_conf["language"])
                 _ = self._execute_model(dummy_batch_audio, dummy_mask, forced_ids, False)
             
@@ -206,20 +263,6 @@ class FlaxWhisperOnlinePipeline:
         threading.Thread(target=self._postprocessing_worker, daemon=True).start()
         
         self.preprocess_pool = ThreadPoolExecutor(max_workers=common_config.get("preprocessing_workers", 64))
-        
-        # Decoding pool
-        self.decode_pool = ProcessPoolExecutor(max_workers=min(32, (os.cpu_count() or 1)))
-        
-        logger.info("Priming decode worker pool...")
-        dummy_audio = bytes(100) 
-        # Prime with 1.0x speed
-        futures = [self.decode_pool.submit(_decode_audio_worker_wrapper, dummy_audio, 16000, 1.0) for _ in range(self.decode_pool._max_workers)]
-        for f in futures:
-            try:
-                f.result()
-            except Exception:
-                pass
-        logger.info("Decode pool primed.")
 
     def __call__(self, audio_data, **kwargs):
         request_id = str(uuid.uuid4())
@@ -236,8 +279,15 @@ class FlaxWhisperOnlinePipeline:
 
     def _preprocess_request(self, audio_data, request_id, kwargs):
         try:
+            mel_ptr = 0
             if isinstance(audio_data, np.ndarray):
                 waveform = audio_data.astype(np.float32)
+            elif self._use_cpu_mel_bf16:
+                waveform, mel_ptr = decode_audio_bytes_with_mel_rs(
+                    audio_data,
+                    self.feature_extractor.sampling_rate,
+                    self.speed_factor,
+                )
             else:
                 waveform = decode_audio_bytes_rs(
                     audio_data,
@@ -253,15 +303,13 @@ class FlaxWhisperOnlinePipeline:
             stride = int(stride_len_s * sr)
             
             total_samples = len(waveform)
-            # Store adjusted duration (or original? usually rtfx uses adjusted)
-            # But for client transparency, they care about original duration.
-            # The result will contain text matching the sped-up audio (faster speech).
             self.requests[request_id]["total_samples"] = total_samples
             
             if total_samples <= chunk_len:
                 self.requests[request_id]["chunk_count"] = 1
                 self.request_queue.put({
                     "audio": waveform,
+                    "mel_ptr": mel_ptr,
                     "request_id": request_id,
                     "chunk_index": 0,
                     "stride": (total_samples, 0, 0),
@@ -281,6 +329,7 @@ class FlaxWhisperOnlinePipeline:
                 
                 self.request_queue.put({
                     "audio": chunk,
+                    "mel_ptr": 0,
                     "request_id": request_id,
                     "chunk_index": current_idx,
                     "stride": (len(chunk), left, right),
@@ -341,11 +390,18 @@ class FlaxWhisperOnlinePipeline:
             
             target_bs = next((b for b in self.batch_buckets if b >= actual_size), self.batch_buckets[-1])
             
-            padded_audio = fill_padded_batch_rs(
-                [job["audio"] for job in batch],
-                target_bs,
-                max_audio_len,
-            )
+            if self._use_cpu_mel_bf16:
+                padded_audio = fill_mel_batch_bf16_rs(
+                    [job.get("mel_ptr", 0) for job in batch],
+                    [job["audio"] for job in batch],
+                    target_bs,
+                )
+            else:
+                padded_audio = fill_padded_batch_rs(
+                    [job["audio"] for job in batch],
+                    target_bs,
+                    max_audio_len,
+                )
             attention_mask = None
             
             kwargs = batch[0]["kwargs"]
@@ -450,7 +506,7 @@ class FlaxWhisperOnlinePipeline:
             task = task if task is not None else "transcribe"
             forced_decoder_ids.append((2, g.task_to_id[task]))
         if not return_timestamps:
-            idx = len(forced_decoder_ids) + 1
+            idx = forced_decoder_ids[-1][0] + 1 if forced_decoder_ids else 1
             forced_decoder_ids.append((idx, g.no_timestamps_token_id))
         return tuple(forced_decoder_ids)
 

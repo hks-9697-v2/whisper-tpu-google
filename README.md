@@ -9,9 +9,20 @@ https://medium.com/@engineerbharath/unlocking-supersonic-speech-recognition-a-de
 
 ## Supported Models
 
-* **`openai/whisper-large-v3`**: Full 32-encoder-layer, 32-decoder-layer model.
-* **`openai/whisper-large-v3-turbo`**: 32-encoder-layer, 4-decoder-layer model.
-  * *Note:* Native Flax weights are not published for `whisper-large-v3-turbo`; this repository automatically converts PyTorch weights to Flax on initialization.
+All OpenAI Whisper model sizes (both English-only `.en` and Multilingual variants) are supported across all attention kernels (`flywheel`, `splash`, `original`, `rpa`) and feature extraction backends (`cpu`, `tpu`):
+
+| Size | Parameters | Layers (Enc / Dec) | Heads (Enc / Dec) | `head_dim` | Mel Bins | English-only | Multilingual |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **tiny** | 39 M | 4 / 4 | 6 / 6 | 64 | 80 | [✓ (`openai/whisper-tiny.en`)](https://huggingface.co/openai/whisper-tiny.en) | [✓ (`openai/whisper-tiny`)](https://huggingface.co/openai/whisper-tiny) |
+| **base** | 74 M | 6 / 6 | 8 / 8 | 64 | 80 | [✓ (`openai/whisper-base.en`)](https://huggingface.co/openai/whisper-base.en) | [✓ (`openai/whisper-base`)](https://huggingface.co/openai/whisper-base) |
+| **small** | 244 M | 12 / 12 | 12 / 12 | 64 | 80 | [✓ (`openai/whisper-small.en`)](https://huggingface.co/openai/whisper-small.en) | [✓ (`openai/whisper-small`)](https://huggingface.co/openai/whisper-small) |
+| **medium** | 769 M | 24 / 24 | 16 / 16 | 64 | 80 | [✓ (`openai/whisper-medium.en`)](https://huggingface.co/openai/whisper-medium.en) | [✓ (`openai/whisper-medium`)](https://huggingface.co/openai/whisper-medium) |
+| **large** | 1550 M | 32 / 32 | 20 / 20 | 64 | 80 | ✗ | [✓ (`openai/whisper-large`)](https://huggingface.co/openai/whisper-large) |
+| **large-v2** | 1550 M | 32 / 32 | 20 / 20 | 64 | 80 | ✗ | [✓ (`openai/whisper-large-v2`)](https://huggingface.co/openai/whisper-large-v2) |
+| **large-v3** | 1550 M | 32 / 32 | 20 / 20 | 64 | 128 | ✗ | [✓ (`openai/whisper-large-v3`)](https://huggingface.co/openai/whisper-large-v3) |
+| **large-v3-turbo** | 809 M | 32 / 4 | 20 / 20 | 64 | 128 | ✗ | [✓ (`openai/whisper-large-v3-turbo`)](https://huggingface.co/openai/whisper-large-v3-turbo) |
+
+* *Note:* For checkpoints without native Flax weights (such as `openai/whisper-large-v3-turbo`), PyTorch weights are automatically converted to Flax on initialization.
 
 ---
 
@@ -21,32 +32,31 @@ The package follows a modular layout under `whisper_jax/`:
 
 ```text
 whisper_jax/
-├── config/          # Model & pipeline configuration classes (configuration_whisper.py)
-├── entrypoints/     # End-to-end pipelines (pipeline.py, pipeline_long_audio.py, pipeline_online.py)
-├── kernels/         # Custom TPU Pallas kernels (FlyWheel Flash Attention, Tokamax Splash & RPA wrappers)
-├── layers/          # Neural network building blocks (conv.py, norms.py)
-├── models/          # Flax Whisper encoder/decoder & fused multi-stage Mega-Decoder (whisper.py)
-├── preprocessing/   # Audio loading, FFmpeg decoding, and Mel filterbank extraction (audio.py)
-└── utils/           # Partitioning and state utilities (partitioner.py, train_state.py)
+├── distributed/   # Partitioning and inference state utilities (partitioner.py, train_state.py)
+├── inputs/        # Native Rust/C audio loader, FFmpeg decoding, and Mel filterbank extraction (audio_loader.py, rust_audio/)
+├── kernels/       # Custom TPU Pallas kernels (FlyWheel Flash Attention, Tokamax Splash & RPA wrappers)
+├── layers/        # Neural network building blocks (norms.py)
+├── models/        # Whisper configuration, Flax encoder/decoder & fused multi-stage Mega-Decoder (configuration_whisper.py, whisper.py)
+└── pipelines/     # End-to-end pipelines (short_audio.py, long_audio.py, long_audio_seek.py, online.py)
 ```
 
- Top-level module paths (`whisper_jax.pipeline`, `whisper_jax.pipeline_long_audio`, `whisper_jax.pipeline_online`, `whisper_jax.modeling_flax_whisper`) are re-exported for backward compatibility.
+Top-level module paths (`whisper_jax.pipeline`, `whisper_jax.pipeline_long_audio`, `whisper_jax.pipeline_online`, `whisper_jax.modeling_flax_whisper`) are re-exported for backward compatibility.
 
 ---
 
 ## Pipeline Architectures
 
-### 1. Standard Batch Pipeline (`whisper_jax/entrypoints/pipeline.py`)
+### 1. Standard Batch Pipeline (`whisper_jax/pipelines/short_audio.py`)
 * **Use Case:** Offline batch transcription of short audio clips (<30s).
 * **Logic:** Data-parallel (`jax.pmap`) execution with bucketed batch padding and persistent ring-buffer staging.
 * **Entrypoint:** `benchmarks/libri-short.py`.
 
-### 2. Long Audio Pipeline (`whisper_jax/entrypoints/pipeline_long_audio.py`)
+### 2. Long Audio Pipeline (`whisper_jax/pipelines/long_audio.py`)
 * **Use Case:** Offline transcription of long-form audio files.
 * **Logic:** Splits long audio into overlapping 30s chunks (`chunk_length_s`, `stride_length_s`), dispatches batches across TPU cores, and merges chunk transcriptions.
 * **Entrypoint:** `benchmarks/libri-long.py`.
 
-### 3. Online Serving Pipeline (`whisper_jax/entrypoints/pipeline_online.py`)
+### 3. Online Serving Pipeline (`whisper_jax/pipelines/online.py`)
 * **Use Case:** Production HTTP API serving (FastAPI).
 * **Logic:** Asynchronous request handling with background audio decoding and dynamic patient batching (`batch_buckets: [4, 40, 80]`).
 * **Entrypoint:** `server/main.py` and `benchmarks/test_api_smart.py`.
@@ -175,7 +185,7 @@ common:
 
 ### 3.2 Short Audio Benchmark (`benchmarks/libri-short.py`)
 
-Use `benchmarks/libri-short.py` for short audio clips (<30 seconds):
+Use `benchmarks/libri-short.py` for short audio clips (<30 seconds). Pass `--model_id` to select any supported Whisper checkpoint:
 
 ```bash
 # Run with default model (openai/whisper-large-v3)
@@ -183,6 +193,12 @@ python3 benchmarks/libri-short.py
 
 # Run with openai/whisper-large-v3-turbo
 python3 benchmarks/libri-short.py --model_id "openai/whisper-large-v3-turbo"
+
+# Run with English-only or smaller multilingual models
+python3 benchmarks/libri-short.py --model_id "openai/whisper-base.en"
+python3 benchmarks/libri-short.py --model_id "openai/whisper-small"
+python3 benchmarks/libri-short.py --model_id "openai/whisper-medium"
+python3 benchmarks/libri-short.py --model_id "openai/whisper-large-v2"
 ```
 
 ### 3.3 Long Audio Benchmark (`benchmarks/libri-long.py`)
@@ -195,6 +211,10 @@ python3 benchmarks/libri-long.py
 
 # Run with openai/whisper-large-v3-turbo
 python3 benchmarks/libri-long.py --model_id "openai/whisper-large-v3-turbo"
+
+# Run with other supported Whisper checkpoints
+python3 benchmarks/libri-long.py --model_id "openai/whisper-medium.en"
+python3 benchmarks/libri-long.py --model_id "openai/whisper-large-v2"
 ```
 
 ### 3.4 Online Server Benchmark

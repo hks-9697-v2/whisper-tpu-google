@@ -444,7 +444,7 @@ class FlaxWhisperPmapPipeline:
             task = task if task is not None else "transcribe"
             forced_decoder_ids.append((2, g.task_to_id[task]))
         if not return_timestamps:
-            idx = len(forced_decoder_ids) + 1
+            idx = forced_decoder_ids[-1][0] + 1 if forced_decoder_ids else 1
             forced_decoder_ids.append((idx, g.no_timestamps_token_id))
         return tuple(forced_decoder_ids)
 

@@ -289,6 +289,19 @@ pub extern "C" fn whisper_rs_init_mel_tables(
         unsafe {
             av_init_mel_tables(window_400, mel_filters_t);
         }
+        let cache = get_cache();
+        cache.chunks.lock().unwrap().clear();
+        cache.chunk_slabs.lock().unwrap().clear();
+        for entry in cache.files.lock().unwrap().values() {
+            if let FlightState::Ready(ref audio) = *entry.state.lock().unwrap() {
+                *audio.mel_bf16.lock().unwrap() = None;
+            }
+        }
+        for entry in cache.bytes.lock().unwrap().values() {
+            if let FlightState::Ready(ref audio) = *entry.state.lock().unwrap() {
+                *audio.mel_bf16.lock().unwrap() = None;
+            }
+        }
     }
 }
 

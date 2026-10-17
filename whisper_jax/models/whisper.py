@@ -1594,6 +1594,8 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         x = input_features.astype(dtype)
         if x.shape[1] == self.config.num_mel_bins:
             x = x.transpose(0, 2, 1)
+        elif x.shape[-1] > self.config.num_mel_bins:
+            x = x[:, :, : self.config.num_mel_bins]
         dn = lax.conv_dimension_numbers(x.shape, ep["conv1_w"].shape, ("NHC", "HIO", "NHC"))
         x = lax.conv_general_dilated(x, ep["conv1_w"], (1,), ((1, 1),), dimension_numbers=dn) + ep["conv1_b"][None, None, :]
         x = jax.nn.gelu(x, approximate=False)
@@ -2115,6 +2117,9 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
 
         if hasattr(generation_config, "return_timestamps") and return_timestamps:
             logits_processor.append(FlaxWhisperTimeStampLogitsProcessor(generation_config, self.config, 1))
+
+        if input_features.shape[1] == 2 * self.config.max_source_positions and input_features.shape[-1] >= self.config.num_mel_bins:
+            input_features = input_features[:, :, : self.config.num_mel_bins].transpose(0, 2, 1)
 
         return super().generate(
             input_features,

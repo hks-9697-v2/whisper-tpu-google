@@ -8,6 +8,7 @@ import numpy as np
 _RUST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rust_audio")
 _SO_PATH = os.path.join(_RUST_DIR, "libwhisper_audio_rs.so")
 _LIB = None
+_CURRENT_MEL_CONFIG = None
 
 _RING_SIZE = 4
 _MEL_RING_BUFFERS = {}
@@ -153,15 +154,33 @@ def get_rust_lib():
     ]
     lib.whisper_rs_fill_padded_batch_dirty.restype = ctypes.c_int
 
-    win_400 = np.ascontiguousarray(np.hanning(400), dtype=np.float32)
-    mel_t = np.ascontiguousarray(librosa.filters.mel(sr=16000, n_fft=400, n_mels=128).T, dtype=np.float32)
+    _LIB = lib
+    configure_mel_tables_rs(n_mels=128, sr=16000, n_fft=400)
+    return _LIB
+
+
+def configure_mel_tables_rs(n_mels: int = 128, sr: int = 16000, n_fft: int = 400):
+    """
+    Configures the native C/Rust Slaney Mel filterbank tables for either 80-bin or 128-bin
+    Whisper models. When n_mels < 128 (e.g. 80 for tiny/base/small/medium/large/large-v2),
+    the filterbank is zero-padded along the channel axis to 128 lanes and sliced in the encoder.
+    """
+    global _CURRENT_MEL_CONFIG
+    lib = get_rust_lib()
+    cfg = (int(sr), int(n_fft), int(n_mels))
+    if _CURRENT_MEL_CONFIG == cfg:
+        return
+    win_400 = np.ascontiguousarray(np.hanning(n_fft), dtype=np.float32)
+    mel_t = np.ascontiguousarray(librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels).T, dtype=np.float32)
+    if n_mels < 128:
+        mel_t_padded = np.zeros((mel_t.shape[0], 128), dtype=np.float32)
+        mel_t_padded[:, :n_mels] = mel_t
+        mel_t = np.ascontiguousarray(mel_t_padded, dtype=np.float32)
     lib.whisper_rs_init_mel_tables(
         win_400.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         mel_t.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
     )
-
-    _LIB = lib
-    return _LIB
+    _CURRENT_MEL_CONFIG = cfg
 
 
 def preallocate_batch_buffers_rs(batch_buckets, max_audio_length: int = 480000, use_mel_bf16: bool = True):

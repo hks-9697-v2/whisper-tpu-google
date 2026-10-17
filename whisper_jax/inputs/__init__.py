@@ -1,4 +1,5 @@
 from .audio_loader import (
+    configure_mel_tables_rs,
     decode_audio_bytes_rs,
     decode_audio_bytes_with_mel_rs,
     decode_audio_file_rs,
@@ -11,6 +12,7 @@ from .audio_loader import (
 
 __all__ = [
     "get_rust_lib",
+    "configure_mel_tables_rs",
     "preallocate_batch_buffers_rs",
     "decode_audio_file_rs",
     "decode_audio_file_with_mel_rs",

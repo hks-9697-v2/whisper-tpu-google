@@ -53,6 +53,7 @@ from ..models.whisper import FlaxWhisperForConditionalGeneration
 from ..distributed.partitioner import PjitPartitioner
 from ..distributed.train_state import InferenceState
 from ..inputs.audio_loader import (
+    configure_mel_tables_rs,
     get_rust_lib,
     preallocate_batch_buffers_rs,
     decode_audio_file_rs,
@@ -147,7 +148,7 @@ class FlaxWhisperPmapPipeline:
             not requested_tpu
             and self.feature_extractor.sampling_rate == 16000
             and self.feature_extractor.n_fft == 400
-            and self.feature_extractor.feature_size == 128
+            and self.feature_extractor.feature_size in (80, 128)
         )
         self.use_tpu_features = requested_tpu or not self._use_cpu_mel_bf16
         self.feature_extraction_backend = "tpu" if self.use_tpu_features else "cpu"
@@ -202,6 +203,12 @@ class FlaxWhisperPmapPipeline:
         # --- Default PMAP Setup ---
         logger.info("Setting up default inference mode using `pmap` (data parallelism)...")
         get_rust_lib()
+        if self._use_cpu_mel_bf16:
+            configure_mel_tables_rs(
+                n_mels=self.feature_extractor.feature_size,
+                sr=self.feature_extractor.sampling_rate,
+                n_fft=self.feature_extractor.n_fft,
+            )
         _get_mel_filterbank_T(
             self.feature_extractor.sampling_rate,
             self.feature_extractor.n_fft,
@@ -591,7 +598,7 @@ class FlaxWhisperPmapPipeline:
             task = task if task is not None else "transcribe"
             forced_decoder_ids.append((2, g.task_to_id[task]))
         if not return_timestamps:
-            idx = len(forced_decoder_ids) + 1
+            idx = forced_decoder_ids[-1][0] + 1 if forced_decoder_ids else 1
             forced_decoder_ids.append((idx, g.no_timestamps_token_id))
         return tuple(forced_decoder_ids)
 
