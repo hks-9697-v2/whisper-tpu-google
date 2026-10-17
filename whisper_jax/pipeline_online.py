@@ -21,6 +21,20 @@ from transformers.utils import logging
 
 # Local imports
 from .modeling_flax_whisper import FlaxWhisperForConditionalGeneration
+from .rust_audio_loader import get_rust_lib, decode_audio_bytes_rs, fill_padded_batch_rs
+
+_HANNING_WINDOW_400 = np.hanning(400).astype(np.float32)
+_MEL_FILTERBANK_CACHE = {}
+
+
+def _get_mel_filterbank_T(sr: int, n_fft: int, n_mels: int) -> np.ndarray:
+    key = (int(sr), int(n_fft), int(n_mels))
+    mel_T = _MEL_FILTERBANK_CACHE.get(key)
+    if mel_T is None:
+        mels = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels)
+        mel_T = np.ascontiguousarray(mels.T, dtype=np.float32)
+        _MEL_FILTERBANK_CACHE[key] = mel_T
+    return mel_T
 
 logger = logging.get_logger(__name__)
 logger.setLevel(logging.INFO)
@@ -117,6 +131,15 @@ class FlaxWhisperOnlinePipeline:
             if hasattr(self.model.generation_config, key):
                 setattr(self.model.generation_config, key, value)
 
+        get_rust_lib()
+        _get_mel_filterbank_T(
+            self.feature_extractor.sampling_rate,
+            self.feature_extractor.n_fft,
+            self.feature_extractor.feature_size,
+        )
+        loaded_params = FlaxWhisperForConditionalGeneration.prepare_fast_params(
+            loaded_params, self.config, dtype=self.dtype, generation_config=self.model.generation_config
+        )
         self.params = jax_utils.replicate(freeze(loaded_params))
         
         del loaded_params
@@ -205,17 +228,11 @@ class FlaxWhisperOnlinePipeline:
             if isinstance(audio_data, np.ndarray):
                 waveform = audio_data.astype(np.float32)
             else:
-                # Pass self.speed_factor to the decoder
-                decode_future = self.decode_pool.submit(
-                    _decode_audio_worker_wrapper, 
-                    audio_data, 
+                waveform = decode_audio_bytes_rs(
+                    audio_data,
                     self.feature_extractor.sampling_rate,
-                    self.speed_factor # <--- Speed injection
+                    self.speed_factor,
                 )
-                waveform = decode_future.result()
-                
-                if isinstance(waveform, Exception):
-                    raise waveform
 
             chunk_len_s = common_config.get("chunk_length_s", 30.0)
             stride_len_s = common_config.get("stride_length_s", 5.0)
@@ -313,20 +330,12 @@ class FlaxWhisperOnlinePipeline:
             
             target_bs = next((b for b in self.batch_buckets if b >= actual_size), self.batch_buckets[-1])
             
-            padded_audio = np.zeros((target_bs, max_audio_len), dtype=np.float32)
-            
-            input_lengths = [job["audio"].shape[0] for job in batch]
-            feature_lengths = (np.array(input_lengths) // 160).astype(np.int32)
-            attention_mask = (np.arange(3000) < feature_lengths[:, None]).astype(np.int32)
-            
-            if target_bs > actual_size:
-                mask_padding = np.zeros((target_bs - actual_size, 3000), dtype=attention_mask.dtype)
-                attention_mask = np.concatenate([attention_mask, mask_padding], axis=0)
-            
-            for i, job in enumerate(batch):
-                a = job["audio"]
-                if len(a) > max_audio_len: a = a[:max_audio_len]
-                padded_audio[i, :len(a)] = a
+            padded_audio = fill_padded_batch_rs(
+                [job["audio"] for job in batch],
+                target_bs,
+                max_audio_len,
+            )
+            attention_mask = None
             
             kwargs = batch[0]["kwargs"]
             forced_decoder_ids = self.get_forced_decoder_ids(**kwargs)
@@ -350,7 +359,7 @@ class FlaxWhisperOnlinePipeline:
 
     def _execute_model(self, input_data, attention_mask, forced_decoder_ids, return_timestamps):
         sharded_data = shard(input_data)
-        sharded_mask = shard(attention_mask)
+        sharded_mask = shard(attention_mask) if attention_mask is not None else None
         
         output_ids = self.p_generate(
             self.params, 
@@ -457,10 +466,17 @@ class FlaxWhisperOnlinePipeline:
     def _stft(waveform, n_fft, hop_length, win_length, window):
         padding = (win_length // 2, win_length // 2)
         padded_waveform = jnp.pad(waveform, padding, mode="reflect")
-        padded_waveform = padded_waveform.reshape(1, -1, 1)
-        frames = jax.lax.conv_general_dilated_patches(
-            padded_waveform, (win_length,), (hop_length,), 'VALID', dimension_numbers=('NWC', 'WIO', 'NWC')
-        )[0]
+        if waveform.shape == (480000,) and n_fft == 400 and hop_length == 160 and win_length == 400:
+            padded_blocks = jnp.pad(padded_waveform, (0, 80)).reshape(3003, 160)
+            frames = jnp.concatenate(
+                [padded_blocks[:-2], padded_blocks[1:-1], padded_blocks[2:, :80]],
+                axis=1,
+            )
+        else:
+            padded_waveform = padded_waveform.reshape(1, -1, 1)
+            frames = jax.lax.conv_general_dilated_patches(
+                padded_waveform, (win_length,), (hop_length,), 'VALID', dimension_numbers=('NWC', 'WIO', 'NWC')
+            )[0]
         windowed_frames = frames * window
         stft_matrix = jnp.fft.rfft(windowed_frames, n=n_fft)
         return stft_matrix
@@ -468,24 +484,21 @@ class FlaxWhisperOnlinePipeline:
     # FIX: Librosa Slaney Filters
     @staticmethod
     def _mel_filterbank(sr, n_fft, n_mels, fmin, fmax):
-        mels = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels)
-        return jnp.array(mels)
+        return jnp.asarray(_get_mel_filterbank_T(sr, n_fft, n_mels).T)
 
     @staticmethod
     def _jax_feature_extractor(waveform, sr, n_fft, hop_length, win_length, n_mels, fmin, fmax, target_feature_length):
-        window = jnp.hanning(win_length)
+        window = jnp.asarray(_HANNING_WINDOW_400) if win_length == 400 else jnp.hanning(win_length)
         stft_matrix = FlaxWhisperOnlinePipeline._stft(waveform, n_fft, hop_length, win_length, window)
-        power_spectrogram = jnp.abs(stft_matrix) ** 2
+        power_spectrogram = jnp.square(stft_matrix.real) + jnp.square(stft_matrix.imag)
         
-        mel_filters = FlaxWhisperOnlinePipeline._mel_filterbank(sr, n_fft, n_mels, fmin, fmax)
-        mel_spectrogram = jnp.dot(power_spectrogram, mel_filters.T)
+        mel_filters_T = jnp.asarray(_get_mel_filterbank_T(sr, n_fft, n_mels))
+        mel_spectrogram = jnp.dot(power_spectrogram[:target_feature_length, :], mel_filters_T)
         
         # FIX: Clamping Normalization
         log_mel_spectrogram = jnp.log10(jnp.maximum(mel_spectrogram, 1e-10))
         max_val = jnp.max(log_mel_spectrogram)
         log_mel_spectrogram = jnp.maximum(log_mel_spectrogram, max_val - 8.0)
-        log_mel_spectrogram = (log_mel_spectrogram + 4.0) / 4.0
+        log_mel_spectrogram = (log_mel_spectrogram + 4.0) * 0.25
         
-        log_mel_spectrogram = log_mel_spectrogram[:target_feature_length, :]
-        log_mel_spectrogram = log_mel_spectrogram.T
-        return log_mel_spectrogram
+        return log_mel_spectrogram.T

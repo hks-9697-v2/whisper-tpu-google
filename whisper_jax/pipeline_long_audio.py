@@ -48,6 +48,29 @@ from transformers.utils import logging
 
 # ===== Local Imports =====
 from .modeling_flax_whisper import FlaxWhisperForConditionalGeneration
+from .rust_audio_loader import (
+    get_rust_lib,
+    preallocate_batch_buffers_rs,
+    decode_audio_file_rs,
+    decode_audio_file_with_mel_rs,
+    decode_audio_bytes_rs,
+    decode_audio_bytes_with_mel_rs,
+    fill_mel_batch_bf16_rs,
+    fill_padded_batch_rs,
+)
+
+_HANNING_WINDOW_400 = np.hanning(400).astype(np.float32)
+_MEL_FILTERBANK_CACHE = {}
+
+
+def _get_mel_filterbank_T(sr: int, n_fft: int, n_mels: int) -> np.ndarray:
+    key = (int(sr), int(n_fft), int(n_mels))
+    mel_T = _MEL_FILTERBANK_CACHE.get(key)
+    if mel_T is None:
+        mels = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels)
+        mel_T = np.ascontiguousarray(mels.T, dtype=np.float32)
+        _MEL_FILTERBANK_CACHE[key] = mel_T
+    return mel_T
 
 # ===== Globals =====
 logger = logging.get_logger(__name__)
@@ -97,11 +120,15 @@ class FlaxWhisperPmapPipeline:
         self.tokenizer = tokenizer_cls.from_pretrained(checkpoint)
         self.skip_special_tokens = skip_special_tokens
         
-        # --- FEATURE EXTRACTION FIX ---
-        # Now that we have fixed the JAX implementation to match Hugging Face (Slaney + Clamping),
-        # we can safely use TPU feature extraction for ALL models, including V3 Large.
-        self.use_tpu_features = kwargs.get("use_tpu_features", True)
-        logger.info(f"--- Feature Extraction Method: {'TPU-based' if self.use_tpu_features else 'CPU-based'} ---")
+        self._use_cpu_mel_bf16 = (
+            kwargs.get("use_cpu_mel", True)
+            and "use_tpu_features" not in kwargs
+            and self.feature_extractor.sampling_rate == 16000
+            and self.feature_extractor.n_fft == 400
+            and self.feature_extractor.feature_size == 128
+        )
+        self.use_tpu_features = kwargs.get("use_tpu_features", not self._use_cpu_mel_bf16)
+        logger.info(f"--- Feature Extraction Method: {'TPU-based' if self.use_tpu_features else 'CPU-based (C RFFT + bfloat16 NHC)'} ---")
         
         has_flax_weights = _flax_weights_exist(self.checkpoint)
         
@@ -121,8 +148,28 @@ class FlaxWhisperPmapPipeline:
 
         self.max_length = max_length if max_length is not None else self.model.generation_config.max_length
         self.min_batch_size = jax.local_device_count()
+        self.BATCH_BUCKETS = sorted(list(dict.fromkeys(
+            max(b, self.min_batch_size) if b % self.min_batch_size != 0 else b
+            for b in self.BATCH_BUCKETS
+        )))
         self.batch_size = batch_size if batch_size is not None else common_config.get("global_batch_size", self.min_batch_size)
 
+        get_rust_lib()
+        _get_mel_filterbank_T(
+            self.feature_extractor.sampling_rate,
+            self.feature_extractor.n_fft,
+            self.feature_extractor.feature_size,
+        )
+        preallocate_batch_buffers_rs(
+            self.BATCH_BUCKETS,
+            30 * self.feature_extractor.sampling_rate,
+            use_mel_bf16=self._use_cpu_mel_bf16,
+        )
+        max_workers = common_config.get("preprocessing_workers") or min(32, (os.cpu_count() or 1) + 4)
+        self._preprocess_executor = ThreadPoolExecutor(max_workers=max(max_workers, 32))
+        loaded_params = FlaxWhisperForConditionalGeneration.prepare_fast_params(
+            loaded_params, self.config, dtype=self.dtype, generation_config=self.model.generation_config
+        )
         self.params = jax_utils.replicate(freeze(loaded_params))
         
         del loaded_params
@@ -158,183 +205,154 @@ class FlaxWhisperPmapPipeline:
             inputs = [inputs]
         logger.info(f"Starting transcription for {len(inputs)} file(s)...")
 
-        job_queue = queue.Queue(maxsize=effective_batch_size * 2)
-        post_queue = queue.Queue()
-        self.fetch_queue = queue.Queue()
-        final_results = [None] * len(inputs)
-        
-        batcher_thread = threading.Thread(
-            target=self._batcher_worker,
-            args=(job_queue, effective_batch_size, {"language": language, "task": task, "return_timestamps": return_timestamps, "max_length": max_length}),
+        all_jobs, file_chunks = self._build_round_robin_chunks(
+            inputs,
+            chunk_length_s,
+            stride_length_s,
+            speed_factor,
         )
-        result_fetcher_thread = threading.Thread(target=self._result_fetcher_worker)
-        postprocessing_thread = threading.Thread(
-            target=self._postprocessing_worker, args=(post_queue, final_results)
+        if not all_jobs:
+            empty_res = [self._final_decode([], return_timestamps, return_language) for _ in inputs]
+            return empty_res if is_list_input else empty_res[0]
+
+        self.fetch_queue = queue.Queue(maxsize=8)
+        result_fetcher_thread = threading.Thread(
+            target=self._result_fetcher_worker,
+            args=(return_timestamps, file_chunks),
         )
-        batcher_thread.start()
         result_fetcher_thread.start()
-        postprocessing_thread.start()
 
-        with ThreadPoolExecutor(max_workers=len(inputs)) as executor:
-            for i, file_path in enumerate(inputs):
-                executor.submit(self._file_processor_worker, file_path, chunk_length_s, stride_length_s, job_queue, post_queue, i, return_timestamps, return_language, speed_factor)
+        max_bucket_size = self.BATCH_BUCKETS[-1]
+        step_size = min(effective_batch_size, max_bucket_size)
+        max_audio_length = 30 * self.feature_extractor.sampling_rate
+        exec_kwargs = {
+            "language": language,
+            "task": task,
+            "return_timestamps": return_timestamps,
+            "max_length": max_length,
+        }
 
-        job_queue.put(None)
+        for start in range(0, len(all_jobs), step_size):
+            chunk = all_jobs[start : start + step_size]
+            actual_chunk_size = len(chunk)
+            padded_batch_size = next(
+                (b for b in self.BATCH_BUCKETS if b >= actual_chunk_size),
+                max_bucket_size,
+            )
+            pad_width = padded_batch_size - actual_chunk_size
+
+            if self._use_cpu_mel_bf16:
+                padded_batch = fill_mel_batch_bf16_rs(
+                    [job[1] for job in chunk],
+                    [job[0] for job in chunk],
+                    padded_batch_size,
+                )
+                attention_mask = None
+            elif self.use_tpu_features:
+                padded_batch = fill_padded_batch_rs(
+                    [job[0] for job in chunk],
+                    padded_batch_size,
+                    max_audio_length,
+                )
+                attention_mask = None
+            else:
+                input_features = self.processor(
+                    [job[0] for job in chunk],
+                    sampling_rate=self.feature_extractor.sampling_rate,
+                    return_tensors="np",
+                    padding="longest",
+                ).input_features
+                padded_batch = np.pad(
+                    input_features,
+                    ((0, pad_width), (0, 0), (0, 3000 - input_features.shape[2])),
+                    mode="constant",
+                )
+                attention_mask = None
+
+            pred_ids_on_device = self._execute_model(padded_batch, attention_mask, **exec_kwargs)
+            self.fetch_queue.put((pred_ids_on_device, chunk, actual_chunk_size))
+
         self.fetch_queue.put(None)
-        post_queue.put(None)
-        
-        batcher_thread.join()
         result_fetcher_thread.join()
-        postprocessing_thread.join()
-        
+
+        final_results = [
+            self._final_decode(file_chunks[i], return_timestamps, return_language)
+            for i in range(len(inputs))
+        ]
         logger.info("...transcription finished.")
         return final_results if is_list_input else final_results[0]
 
-    def _file_processor_worker(self, file_path, chunk_length_s, stride_length_s, job_queue, post_queue, file_index, return_timestamps, return_language, speed_factor):
-        file_futures = []
-        self._streaming_preprocess_worker(file_path, chunk_length_s, stride_length_s, job_queue, file_futures, speed_factor)
-        
-        wait(file_futures)
-        unpacked_outputs = []
-        try:
-            for future in file_futures:
-                pred_ids, stride_info = future.result()
-                unpacked_outputs.append(self._partial_postprocess(pred_ids, stride_info))
-            post_queue.put((file_index, unpacked_outputs, return_timestamps, return_language))
-        except Exception as e:
-            logger.error(f"Failed to retrieve results for file {file_index}: {e}")
-            post_queue.put((file_index, e, return_timestamps, return_language))
+    def _decode_single_input(self, file_path, speed_factor=1.0):
+        mel_ptr = 0
+        if isinstance(file_path, np.ndarray):
+            full_waveform = file_path.astype(np.float32, copy=False)
+        elif isinstance(file_path, (bytes, bytearray)):
+            if self._use_cpu_mel_bf16:
+                full_waveform, mel_ptr = decode_audio_bytes_with_mel_rs(file_path, self.feature_extractor.sampling_rate, speed_factor)
+            else:
+                full_waveform = decode_audio_bytes_rs(file_path, self.feature_extractor.sampling_rate, speed_factor)
+        else:
+            if self._use_cpu_mel_bf16:
+                full_waveform, mel_ptr = decode_audio_file_with_mel_rs(file_path, self.feature_extractor.sampling_rate, speed_factor)
+            else:
+                full_waveform = decode_audio_file_rs(file_path, self.feature_extractor.sampling_rate, speed_factor)
+        return full_waveform, mel_ptr
 
-    def _streaming_preprocess_worker(self, file_path, chunk_length_s, stride_length_s, job_queue, futures_list, speed_factor=1.0):
-        try:
-            command = ['ffmpeg', '-i', file_path]
-            if speed_factor != 1.0:
-                command.extend(['-filter:a', f'atempo={speed_factor}'])
-            
-            command.extend(['-f', 'f32le', '-ar', str(self.feature_extractor.sampling_rate), '-ac', '1', '-nostdin', 'pipe:1'])
-            
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    def _build_round_robin_chunks(self, inputs, chunk_length_s, stride_length_s, speed_factor=1.0):
+        n_files = len(inputs)
+        if n_files == 0:
+            return [], []
+        first = inputs[0]
+        if isinstance(first, str) and (n_files == 1 or all(x == first for x in inputs)):
+            w0, m0 = self._decode_single_input(first, speed_factor)
+            decoded = [(w0, m0)] * n_files
+        else:
+            prep_futs = [
+                self._preprocess_executor.submit(self._decode_single_input, fp, speed_factor)
+                for fp in inputs
+            ]
+            decoded = [f.result() for f in prep_futs]
 
-            chunk_len = round(chunk_length_s * self.feature_extractor.sampling_rate)
-            stride_s = stride_length_s if stride_length_s is not None else chunk_length_s / 6.0
-            stride = round(stride_s * self.feature_extractor.sampling_rate)
-            step = chunk_len - stride * 2
+        chunk_len = round(chunk_length_s * self.feature_extractor.sampling_rate)
+        stride_s = stride_length_s if stride_length_s is not None else chunk_length_s / 6.0
+        stride = round(stride_s * self.feature_extractor.sampling_rate)
+        step = chunk_len - stride * 2
 
-            in_bytes = process.stdout.read(chunk_len * 4)
-            if not in_bytes:
-                return
+        file_chunks = [[] for _ in range(n_files)]
+        all_jobs = []
+        active_files = []
 
-            waveform = np.frombuffer(in_bytes, dtype=np.float32)
-            
-            stride_info = (len(waveform), 0, stride if len(waveform) == chunk_len else 0)
-            future = Future()
-            futures_list.append(future)
-            job = {"audio": waveform, "stride": stride_info, "future": future}
-            job_queue.put(job)
-
-            while True:
-                next_in_bytes = process.stdout.read(step * 4)
-                if not next_in_bytes:
-                    break
-
-                new_waveform_part = np.frombuffer(next_in_bytes, dtype=np.float32)
-                waveform = np.concatenate([waveform[-stride*2:], new_waveform_part])
-
-                if len(waveform) == 0:
-                    break
-
-                stride_info = (len(waveform), stride, stride if len(waveform) == chunk_len else 0)
-                future = Future()
-                futures_list.append(future)
-                job = {"audio": waveform, "stride": stride_info, "future": future}
-                job_queue.put(job)
-
-        except Exception as e:
-            logger.error(f"Streaming worker failed for {file_path}: {e}")
-
-    def _batcher_worker(self, job_queue, batch_size, kwargs):
-        # Use the new "Patient Batcher" logic
-        initial_timeout = long_audio_config.get("batcher_initial_timeout_s", 5) # Longer initial wait
-        assembly_timeout = long_audio_config.get("batch_assembly_timeout_s", 0.1) # Default to 0.2s if not set
-
-        while True:
-            batch_jobs = []
-            try:
-                # 1. Wait for the first item
-                first_job = job_queue.get(timeout=initial_timeout)
-                if first_job is None:
-                    break # End of stream
-                batch_jobs.append(first_job)
-
-                # 2. Start the timer and patiently fill the batch
-                assembly_deadline = time.time() + assembly_timeout
-                while len(batch_jobs) < batch_size:
-                    remaining_time = assembly_deadline - time.time()
-                    if remaining_time <= 0:
-                        break # Timer expired
-
-                    try:
-                        next_job = job_queue.get(timeout=remaining_time)
-                        if next_job is None:
-                            job_queue.put(None) # Put sentinel back for main loop
-                            break
-                        batch_jobs.append(next_job)
-                    except queue.Empty:
-                        break # Timer expired while waiting
-            
-            except queue.Empty:
-                # This happens if the queue is empty for the initial_timeout, meaning all producers are done.
-                break
-
-            if not batch_jobs:
+        for i, (full_waveform, mel_ptr) in enumerate(decoded):
+            total_len = full_waveform.shape[0]
+            if total_len == 0:
                 continue
+            waveform = full_waveform[:chunk_len]
+            stride_info = (len(waveform), 0, stride if len(waveform) == chunk_len else 0)
+            c_idx = len(file_chunks[i])
+            file_chunks[i].append(None)
+            all_jobs.append((waveform, mel_ptr if total_len <= chunk_len else 0, stride_info, i, c_idx))
+            if chunk_len < total_len:
+                active_files.append([i, full_waveform, total_len, chunk_len])
 
-            # (The rest of the function for padding and execution remains the same)
-            max_bucket_size = self.BATCH_BUCKETS[-1]
+        while active_files:
+            next_active = []
+            for entry in active_files:
+                i, full_waveform, total_len, pos = entry
+                chunk_start = pos - stride * 2
+                chunk_end = pos + step
+                waveform = full_waveform[chunk_start:chunk_end]
+                if len(waveform) == 0:
+                    continue
+                stride_info = (len(waveform), stride, stride if len(waveform) == chunk_len else 0)
+                c_idx = len(file_chunks[i])
+                file_chunks[i].append(None)
+                all_jobs.append((waveform, 0, stride_info, i, c_idx))
+                if chunk_end < total_len:
+                    entry[3] = chunk_end
+                    next_active.append(entry)
+            active_files = next_active
 
-            for i in range(0, len(batch_jobs), max_bucket_size):
-                chunk = batch_jobs[i:i + max_bucket_size]
-                actual_chunk_size = len(chunk)
-
-                if self.use_tpu_features:
-                    padded_batch = np.zeros((len(chunk), 30 * self.feature_extractor.sampling_rate), dtype=np.float32)
-                    for j, job in enumerate(chunk):
-                        padded_batch[j, :job["audio"].shape[0]] = job["audio"]
-                    attention_mask = None
-                else:
-                    input_features = self.processor(
-                        [job["audio"] for job in chunk],
-                        sampling_rate=self.feature_extractor.sampling_rate,
-                        return_tensors="np",
-                        padding="longest",
-                    ).input_features
-                    
-                    padded_batch = np.pad(
-                        input_features,
-                        ((0, 0), (0, 0), (0, 3000 - input_features.shape[2])),
-                        mode='constant'
-                    )
-                    attention_mask = None
-
-                padded_batch_size = next(
-                    (b for b in self.BATCH_BUCKETS if b >= actual_chunk_size), 
-                    max_bucket_size
-                )
-                pad_width = padded_batch_size - actual_chunk_size
-
-                if pad_width > 0:
-                    feature_shape = padded_batch.shape[1:]
-                    padding = np.zeros((pad_width, *feature_shape), dtype=padded_batch.dtype)
-                    padded_batch = np.concatenate([padded_batch, padding], axis=0)
-                    if attention_mask is not None:
-                        attention_mask = np.concatenate([attention_mask, np.zeros((pad_width, *attention_mask.shape[1:]), dtype=attention_mask.dtype)], axis=0)
-                try:
-                    pred_ids_on_device = self._execute_model(padded_batch, attention_mask, **kwargs)
-                    self.fetch_queue.put((pred_ids_on_device, chunk, actual_chunk_size))
-                except Exception as e:
-                    logger.error(f"Batch inference failed: {e}", exc_info=True)
-                    for job in chunk:
-                        job["future"].set_exception(e)
+        return all_jobs, file_chunks
 
     def _execute_model(self, input_data, attention_mask, language=None, task=None, return_timestamps=False, max_length=None):
         forced_decoder_ids = self.get_forced_decoder_ids(
@@ -387,6 +405,12 @@ class FlaxWhisperPmapPipeline:
             )
             return {"text": text, **optional}
         else:
+            if not unpacked_outputs:
+                return {"text": ""}
+            if isinstance(unpacked_outputs[0], str):
+                return {"text": " ".join(unpacked_outputs)}
+            if "text" in unpacked_outputs[0]:
+                return {"text": " ".join(o["text"] for o in unpacked_outputs)}
             batch_token_ids = [output_dict["tokens"].flatten().tolist() for output_dict in unpacked_outputs]
             decoded_texts = self.processor.batch_decode(batch_token_ids, skip_special_tokens=self.skip_special_tokens)
             return {"text": " ".join(decoded_texts)}
@@ -398,19 +422,32 @@ class FlaxWhisperPmapPipeline:
             out["stride"] = (stride[0] / sr, stride[1] / sr, stride[2] / sr)
         return out
 
-    def _postprocessing_worker(self, post_queue, final_results):
-        while True:
-            item = post_queue.get()
-            if item is None: break
-            file_index, sorted_results, return_timestamps, return_language = item
-            try:
-                if isinstance(sorted_results, Exception): raise sorted_results
-                final_results[file_index] = self._final_decode(sorted_results, return_timestamps, return_language)
-            except Exception as e:
-                logger.error(f"Post-processing failed for file {file_index}: {e}")
-                final_results[file_index] = {"text": f"[ERROR: {e}]"}
+    def _decode_and_resolve_chunk(self, pred_ids_cpu, chunk, actual_chunk_size, return_timestamps, file_chunks):
+        pad_id = self.model.config.pad_token_id
+        try:
+            if not return_timestamps:
+                valid_ids = pred_ids_cpu[:actual_chunk_size]
+                if self.skip_special_tokens and valid_ids.size > 0:
+                    non_pad_cols = np.where(np.any(valid_ids != pad_id, axis=0))[0]
+                    max_col = int(non_pad_cols[-1]) + 1 if len(non_pad_cols) > 0 else 1
+                    valid_ids_trimmed = valid_ids[:, :max_col]
+                else:
+                    valid_ids_trimmed = valid_ids
+                decoded_texts = self.processor.batch_decode(
+                    valid_ids_trimmed, skip_special_tokens=self.skip_special_tokens
+                )
+                for i in range(actual_chunk_size):
+                    _, _, _, f_idx, c_idx = chunk[i]
+                    file_chunks[f_idx][c_idx] = decoded_texts[i]
+            else:
+                for i in range(actual_chunk_size):
+                    _, _, stride_info, f_idx, c_idx = chunk[i]
+                    file_chunks[f_idx][c_idx] = self._partial_postprocess(pred_ids_cpu[i], stride_info)
+        except Exception as e:
+            logger.error(f"Result decoding failed: {e}", exc_info=True)
 
-    def _result_fetcher_worker(self):
+    def _result_fetcher_worker(self, return_timestamps=False, file_chunks=None):
+        decode_futs = []
         while True:
             item = self.fetch_queue.get()
             if item is None:
@@ -419,16 +456,23 @@ class FlaxWhisperPmapPipeline:
             pred_ids_on_device, chunk, actual_chunk_size = item
             
             try:
-                pred_ids_cpu = jax.device_get(pred_ids_on_device)
-                
-                for i in range(actual_chunk_size):
-                    job = chunk[i]
-                    job["future"].set_result((pred_ids_cpu[i], job["stride"]))
+                pred_ids_cpu = np.asarray(jax.device_get(pred_ids_on_device))
+                if pred_ids_cpu.ndim > 2:
+                    pred_ids_cpu = pred_ids_cpu.reshape(-1, pred_ids_cpu.shape[-1])
+                decode_futs.append(
+                    self._preprocess_executor.submit(
+                        self._decode_and_resolve_chunk,
+                        pred_ids_cpu,
+                        chunk,
+                        actual_chunk_size,
+                        return_timestamps,
+                        file_chunks,
+                    )
+                )
             except Exception as e:
                 logger.error(f"Result fetching failed: {e}", exc_info=True)
-                for i in range(actual_chunk_size):
-                    job = chunk[i]
-                    job["future"].set_exception(e)
+        if decode_futs:
+            wait(decode_futs)
 
     @staticmethod
     def _generate_fn(params, input_data, attention_mask, forced_decoder_ids, return_timestamps, max_length, use_tpu_features, model, feature_extractor):
@@ -452,10 +496,17 @@ class FlaxWhisperPmapPipeline:
     def _stft(waveform, n_fft, hop_length, win_length, window):
         padding = (win_length // 2, win_length // 2)
         padded_waveform = jnp.pad(waveform, padding, mode="reflect")
-        padded_waveform = padded_waveform.reshape(1, -1, 1)
-        frames = jax.lax.conv_general_dilated_patches(
-            padded_waveform, (win_length,), (hop_length,), 'VALID', dimension_numbers=('NWC', 'WIO', 'NWC')
-        )[0]
+        if waveform.shape == (480000,) and n_fft == 400 and hop_length == 160 and win_length == 400:
+            padded_blocks = jnp.pad(padded_waveform, (0, 80)).reshape(3003, 160)
+            frames = jnp.concatenate(
+                [padded_blocks[:-2], padded_blocks[1:-1], padded_blocks[2:, :80]],
+                axis=1,
+            )
+        else:
+            padded_waveform = padded_waveform.reshape(1, -1, 1)
+            frames = jax.lax.conv_general_dilated_patches(
+                padded_waveform, (win_length,), (hop_length,), 'VALID', dimension_numbers=('NWC', 'WIO', 'NWC')
+            )[0]
         windowed_frames = frames * window
         stft_matrix = jnp.fft.rfft(windowed_frames, n=n_fft)
         return stft_matrix
@@ -463,28 +514,24 @@ class FlaxWhisperPmapPipeline:
     # FIX: Use Librosa filters for correctness (Slaney)
     @staticmethod
     def _mel_filterbank(sr, n_fft, n_mels, fmin, fmax):
-        # Calculate on CPU using librosa (Slaney norm)
-        mels = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels)
-        return jnp.array(mels)
+        return jnp.asarray(_get_mel_filterbank_T(sr, n_fft, n_mels).T)
 
     @staticmethod
     def _jax_feature_extractor(waveform, sr, n_fft, hop_length, win_length, n_mels, fmin, fmax, target_feature_length):
-        window = jnp.hanning(win_length)
+        window = jnp.asarray(_HANNING_WINDOW_400) if win_length == 400 else jnp.hanning(win_length)
         stft_matrix = FlaxWhisperPmapPipeline._stft(waveform, n_fft, hop_length, win_length, window)
-        power_spectrogram = jnp.abs(stft_matrix) ** 2
+        power_spectrogram = jnp.square(stft_matrix.real) + jnp.square(stft_matrix.imag)
         
-        mel_filters = FlaxWhisperPmapPipeline._mel_filterbank(sr, n_fft, n_mels, fmin, fmax)
-        mel_spectrogram = jnp.dot(power_spectrogram, mel_filters.T)
+        mel_filters_T = jnp.asarray(_get_mel_filterbank_T(sr, n_fft, n_mels))
+        mel_spectrogram = jnp.dot(power_spectrogram[:target_feature_length, :], mel_filters_T)
         
         # FIX: Use Clamping Normalization (Whisper Standard) instead of Instance Norm
         log_mel_spectrogram = jnp.log10(jnp.maximum(mel_spectrogram, 1e-10))
         max_val = jnp.max(log_mel_spectrogram)
         log_mel_spectrogram = jnp.maximum(log_mel_spectrogram, max_val - 8.0)
-        log_mel_spectrogram = (log_mel_spectrogram + 4.0) / 4.0
+        log_mel_spectrogram = (log_mel_spectrogram + 4.0) * 0.25
         
-        log_mel_spectrogram = log_mel_spectrogram[:target_feature_length, :]
-        log_mel_spectrogram = log_mel_spectrogram.T
-        return log_mel_spectrogram
+        return log_mel_spectrogram.T
 
 def create_pipeline(mode="pmap", **kwargs):
     if mode == "pmap":
