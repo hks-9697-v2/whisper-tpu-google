@@ -1,0 +1,201 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="890" viewBox="0 0 1280 890" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+    <style>
+      .title { font-size: 24px; font-weight: 700; fill: #0f172a; }
+      .sub { font-size: 13px; fill: #475569; }
+      .layer { font-size: 13px; font-weight: 700; fill: #334155; letter-spacing: 0.3px; }
+      .layerpath { font-size: 12px; fill: #64748b; font-family: SFMono-Regular, Menlo, Consolas, monospace; }
+      .bt { font-size: 13px; font-weight: 700; fill: #0f172a; }
+      .mono { font-family: SFMono-Regular, Menlo, Consolas, monospace; }
+      .bd { font-size: 12px; fill: #334155; }
+      .note { font-size: 12.5px; fill: #334155; }
+      .line { stroke: #475569; stroke-width: 1.6; fill: none; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="890" fill="#ffffff"/>
+
+  <!-- Title -->
+  <text x="30" y="40" class="title">whisper-tpu-google: how a request becomes text</text>
+  <text x="30" y="60" class="sub">Whisper on Cloud TPU v6e / v7x with JAX: entry points → pipelines → host preprocessing → TPU encoder/decoder → text</text>
+
+  <!-- ================= LEFT: LAYERED STACK ================= -->
+
+  <!-- Layer 1: Entry points -->
+  <rect x="30" y="76" width="790" height="110" rx="10" fill="#eef2ff" stroke="#c7d2fe"/>
+  <text x="46" y="98" class="layer">1 · ENTRY POINTS</text>
+  <rect x="46" y="108" width="242" height="64" rx="8" fill="#ffffff" stroke="#6366f1"/>
+  <text x="58" y="134" class="bt mono">benchmarks/libri-short.py</text>
+  <text x="58" y="154" class="bd">Short clips, concurrency sweep</text>
+  <rect x="304" y="108" width="242" height="64" rx="8" fill="#ffffff" stroke="#6366f1"/>
+  <text x="316" y="134" class="bt mono">benchmarks/libri-long.py</text>
+  <text x="316" y="154" class="bd">Long files, 10 in parallel</text>
+  <rect x="562" y="108" width="242" height="64" rx="8" fill="#ffffff" stroke="#6366f1"/>
+  <text x="574" y="134" class="bt mono">server/main.py</text>
+  <text x="574" y="154" class="bd">FastAPI · /transcribe(_stream)</text>
+
+  <!-- Layer 2: Pipelines -->
+  <rect x="30" y="204" width="790" height="130" rx="10" fill="#ecfdf5" stroke="#a7f3d0"/>
+  <text x="46" y="226" class="layer">2 · PIPELINES</text>
+  <text x="160" y="226" class="layerpath">whisper_jax/pipelines/</text>
+
+  <!-- arrows L1 -> L2 (drawn after the panel so arrowheads stay visible) -->
+  <line x1="167" y1="172" x2="175" y2="236" class="line" marker-end="url(#arr)"/>
+  <line x1="425" y1="172" x2="328" y2="236" class="line" marker-end="url(#arr)"/>
+  <line x1="683" y1="172" x2="714" y2="236" class="line" marker-end="url(#arr)"/>
+  <rect x="46" y="238" width="179" height="84" rx="8" fill="#ffffff" stroke="#10b981"/>
+  <text x="58" y="260" class="bt mono">short_audio.py</text>
+  <text x="58" y="280" class="bd">Offline batches</text>
+  <text x="58" y="297" class="bd">Clips under 30 s, longer</text>
+  <text x="58" y="313" class="bd">clips auto-chunked</text>
+  <rect x="239" y="238" width="179" height="84" rx="8" fill="#ffffff" stroke="#10b981"/>
+  <text x="251" y="260" class="bt mono">long_audio.py</text>
+  <text x="251" y="280" class="bd">Offline long-form audio</text>
+  <text x="251" y="297" class="bd">Splits into 30 s chunks</text>
+  <text x="251" y="313" class="bd">with overlapping stride</text>
+  <rect x="432" y="238" width="179" height="84" rx="8" fill="#ffffff" stroke="#10b981"/>
+  <text x="444" y="260" class="bt mono">long_audio_seek.py</text>
+  <text x="444" y="280" class="bd">Offline long-form audio</text>
+  <text x="444" y="297" class="bd">ffmpeg seeks to each</text>
+  <text x="444" y="313" class="bd">chunk separately</text>
+  <rect x="625" y="238" width="179" height="84" rx="8" fill="#ffffff" stroke="#10b981" stroke-width="2"/>
+  <text x="637" y="260" class="bt mono">online.py</text>
+  <text x="637" y="280" class="bd">Async serving</text>
+  <text x="637" y="297" class="bd">Continuous batching</text>
+  <text x="637" y="313" class="bd" font-weight="700">→ see right panel</text>
+  <line x1="804" y1="280" x2="846" y2="280" class="line" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+
+  <!-- arrow L2 -> L3 -->
+  <line x1="425" y1="334" x2="425" y2="358" class="line" marker-end="url(#arr)"/>
+
+  <!-- Layer 3: Host CPU -->
+  <rect x="30" y="360" width="790" height="120" rx="10" fill="#fff7ed" stroke="#fed7aa"/>
+  <text x="46" y="382" class="layer">3 · HOST CPU</text>
+  <text x="152" y="382" class="layerpath">whisper_jax/inputs/  (native Rust + C)</text>
+  <rect x="46" y="394" width="242" height="72" rx="8" fill="#ffffff" stroke="#f97316"/>
+  <text x="58" y="416" class="bt">Decode audio</text>
+  <text x="58" y="436" class="bd">In-process FFmpeg (libav)</text>
+  <text x="58" y="453" class="bd">Optional speed-up (speed_factor)</text>
+  <rect x="304" y="394" width="242" height="72" rx="8" fill="#ffffff" stroke="#f97316"/>
+  <text x="316" y="416" class="bt">Log-Mel features</text>
+  <text x="316" y="436" class="bd">Slaney filterbank, C RFFT</text>
+  <text x="316" y="453" class="bd" font-family="SFMono-Regular, Menlo, Consolas, monospace">→ bf16 (B, 3000, 128)</text>
+  <rect x="562" y="394" width="242" height="72" rx="8" fill="#ffffff" stroke="#f97316"/>
+  <text x="574" y="416" class="bt">Batch staging</text>
+  <text x="574" y="436" class="bd">Pad to bucket [4, 40, 80]</text>
+  <text x="574" y="453" class="bd">Pre-allocated ring buffers</text>
+  <line x1="288" y1="430" x2="302" y2="430" class="line" marker-end="url(#arr)"/>
+  <line x1="546" y1="430" x2="560" y2="430" class="line" marker-end="url(#arr)"/>
+
+  <!-- arrow L3 -> L4 with pmap label -->
+  <line x1="425" y1="480" x2="425" y2="514" class="line" marker-end="url(#arr)"/>
+  <text x="437" y="502" class="bd" font-style="italic">jax.pmap: batch split across TPU chips (4 × v6e or 8 × v7x)</text>
+
+  <!-- Layer 4: TPU -->
+  <rect x="30" y="516" width="790" height="198" rx="10" fill="#f0f9ff" stroke="#bae6fd"/>
+  <text x="46" y="538" class="layer">4 · TPU</text>
+  <text x="112" y="538" class="layerpath">whisper_jax/models/whisper.py  +  whisper_jax/kernels/</text>
+  <rect x="46" y="550" width="300" height="110" rx="8" fill="#ffffff" stroke="#0ea5e9"/>
+  <text x="58" y="574" class="bt">Encoder</text>
+  <text x="58" y="595" class="bd">Mel frames → audio hidden states</text>
+  <text x="58" y="613" class="bd">Self-attention: FlyWheel Pallas flash</text>
+  <text x="58" y="631" class="bd">attention by default (Splash optional)</text>
+  <text x="58" y="649" class="bd">Block sizes tuned per chip (v6e / v7x)</text>
+  <line x1="346" y1="605" x2="374" y2="605" class="line" marker-end="url(#arr)"/>
+  <rect x="376" y="550" width="428" height="110" rx="8" fill="#ffffff" stroke="#0ea5e9"/>
+  <text x="388" y="574" class="bt">Decoder (greedy, KV cache)</text>
+  <text x="388" y="595" class="bd"><tspan font-weight="700">Offline:</tspan> fused Mega-Decoder, cache grows 64 → 128 → 512</text>
+  <text x="388" y="613" class="bd"><tspan font-weight="700">Online:</tspan> pipeline_quantum_step, decodes in 64-token quanta</text>
+  <text x="388" y="631" class="bd">Language/task tokens are per-row data, (B, 4) int32,</text>
+  <text x="388" y="649" class="bd">so mixed requests share a batch without recompiling</text>
+  <rect x="46" y="670" width="758" height="32" rx="6" fill="#e0f2fe" stroke="#7dd3fc"/>
+  <text x="58" y="691" class="bd"><tspan font-weight="700">Pallas kernels:</tspan> <tspan font-family="SFMono-Regular, Menlo, Consolas, monospace">flywheel/</tspan> (flash + KV-cache attention) · <tspan font-family="SFMono-Regular, Menlo, Consolas, monospace">splash_attention/</tspan> · <tspan font-family="SFMono-Regular, Menlo, Consolas, monospace">ragged_paged_attention/</tspan></text>
+
+  <!-- arrow L4 -> L5 -->
+  <line x1="425" y1="714" x2="425" y2="728" class="line" marker-end="url(#arr)"/>
+
+  <!-- Layer 5: Post-process -->
+  <rect x="30" y="730" width="790" height="48" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="46" y="759" class="layer">5 · POST-PROCESS</text>
+  <text x="190" y="759" class="bd">Copy token ids to host → tokenizer.batch_decode → join chunk texts → return text</text>
+
+  <!-- Config -->
+  <rect x="30" y="792" width="790" height="76" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-dasharray="5 4"/>
+  <text x="46" y="815" class="bt mono">config.yml</text>
+  <text x="136" y="815" class="bd">(constructor arguments can override these)</text>
+  <text x="46" y="837" class="bd">encoder / decoder_attention_implementation · feature_extraction_backend (cpu | tpu) · batch_buckets</text>
+  <text x="46" y="856" class="bd">chunk_length_s · stride_length_s · speed_factor · generation.max_length</text>
+
+  <!-- ================= RIGHT: ONLINE CONTINUOUS BATCHING ================= -->
+  <rect x="850" y="76" width="400" height="792" rx="10" fill="#faf5ff" stroke="#e9d5ff"/>
+  <text x="866" y="98" class="layer">ONLINE CONTINUOUS BATCHING</text>
+  <text x="866" y="116" class="layerpath">whisper_jax/pipelines/online.py</text>
+
+  <!-- a: request -->
+  <rect x="880" y="128" width="340" height="48" rx="8" fill="#ffffff" stroke="#a855f7"/>
+  <text x="892" y="148" class="bt">HTTP request (audio bytes)</text>
+  <text x="892" y="166" class="bd">server/main.py calls pipeline(...) and gets a Future</text>
+  <line x1="1050" y1="176" x2="1050" y2="194" class="line" marker-end="url(#arr)"/>
+
+  <!-- b: preprocess -->
+  <rect x="880" y="196" width="340" height="48" rx="8" fill="#ffffff" stroke="#a855f7"/>
+  <text x="892" y="216" class="bt">Preprocess thread pool</text>
+  <text x="892" y="234" class="bd">Decode + Mel; audio over 30 s split into chunks</text>
+  <line x1="960" y1="244" x2="960" y2="266" class="line" marker-end="url(#arr)"/>
+
+  <!-- c: queues -->
+  <rect x="880" y="268" width="160" height="56" rx="8" fill="#ffffff" stroke="#a855f7"/>
+  <text x="892" y="290" class="bt mono">request_queue</text>
+  <text x="892" y="310" class="bd">New work, cur_len = 1</text>
+  <rect x="1060" y="268" width="160" height="56" rx="8" fill="#ffffff" stroke="#a855f7"/>
+  <text x="1072" y="290" class="bt mono">active_queue</text>
+  <text x="1072" y="310" class="bd">Unfinished, cur_len ≥ 64</text>
+  <line x1="960" y1="324" x2="1010" y2="352" class="line" marker-end="url(#arr)"/>
+  <line x1="1140" y1="324" x2="1090" y2="352" class="line" marker-end="url(#arr)"/>
+
+  <!-- d: batcher -->
+  <rect x="880" y="354" width="340" height="66" rx="8" fill="#ffffff" stroke="#a855f7"/>
+  <text x="892" y="375" class="bt">Batcher</text>
+  <text x="892" y="393" class="bd">Takes active_queue first, fills the rest from</text>
+  <text x="892" y="410" class="bd">request_queue, pads to a bucket size</text>
+  <line x1="1050" y1="420" x2="1050" y2="440" class="line" marker-end="url(#arr)"/>
+
+  <!-- e: quantum -->
+  <rect x="880" y="442" width="340" height="86" rx="8" fill="#ffffff" stroke="#7c3aed" stroke-width="2"/>
+  <text x="892" y="463" class="bt">One quantum on TPU (p_quantum)</text>
+  <text x="892" y="482" class="bd">Each row decodes up to 64 more tokens</text>
+  <text x="892" y="499" class="bd">All-new batch: fast path, no prefill</text>
+  <text x="892" y="516" class="bd">Mixed batch: rebuild prefix KV, then decode per row</text>
+  <line x1="1050" y1="528" x2="1050" y2="548" class="line" marker-end="url(#arr)"/>
+
+  <!-- f: fetcher -->
+  <rect x="880" y="550" width="340" height="48" rx="8" fill="#ffffff" stroke="#a855f7"/>
+  <text x="892" y="570" class="bt">Result fetcher</text>
+  <text x="892" y="588" class="bd">Copies seqs, cur_len, is_finished to host</text>
+  <line x1="990" y1="598" x2="960" y2="622" class="line" marker-end="url(#arr)"/>
+  <line x1="1110" y1="598" x2="1140" y2="622" class="line" marker-end="url(#arr)"/>
+
+  <!-- g: split -->
+  <rect x="880" y="624" width="160" height="56" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+  <text x="892" y="646" class="bt">Finished</text>
+  <text x="892" y="666" class="bd">Text → resolve Future</text>
+  <rect x="1060" y="624" width="160" height="56" rx="8" fill="#fef3c7" stroke="#d97706"/>
+  <text x="1072" y="646" class="bt">Not finished</text>
+  <text x="1072" y="666" class="bd">Back to active_queue</text>
+
+  <!-- loop: unfinished -> active_queue -->
+  <path d="M1220,652 L1238,652 L1238,296 L1222,296" class="line" stroke="#d97706" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <!-- notes -->
+  <line x1="880" y1="702" x2="1220" y2="702" stroke="#e9d5ff"/>
+  <text x="880" y="726" class="bt">What this buys you</text>
+  <text x="880" y="748" class="note">• Short requests return after their first quantum,</text>
+  <text x="892" y="766" class="note">without waiting for long ones in the same batch</text>
+  <text x="880" y="788" class="note">• Long requests keep decoding in later quanta,</text>
+  <text x="892" y="806" class="note">in the same batch as newly arrived requests</text>
+  <text x="880" y="828" class="note">• Mixed languages / tasks share one batch</text>
+  <text x="880" y="850" class="note">• Up to 2 quanta in flight to overlap host staging</text>
+</svg>

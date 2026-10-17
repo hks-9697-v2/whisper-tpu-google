@@ -5,6 +5,10 @@ This implementation is based on the original [sanchit-gandhi/whisper-jax](https:
 For additional background on the original implementation, see:
 https://medium.com/@engineerbharath/unlocking-supersonic-speech-recognition-a-deep-dive-into-optimizing-whisper-on-tpus-6b8d734993d9
 
+![Architecture](docs/architecture.svg)
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a walkthrough of the diagram.
+
 ---
 
 ## Supported Models
