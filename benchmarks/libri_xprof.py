@@ -30,8 +30,8 @@ from rich.console import Console
 from rich.panel import Panel
 
 # ===== Local/Project Imports =====
-from whisper_jax.pipeline_long_audio import create_pipeline as create_long_audio_pipeline
-from whisper_jax.pipeline import FlaxWhisperPmapPipeline
+from whisper_jax.pipelines.long_audio import create_pipeline as create_long_audio_pipeline
+from whisper_jax.pipelines.short_audio import FlaxWhisperPmapPipeline
 
 # --- Configuration ---
 console = Console()

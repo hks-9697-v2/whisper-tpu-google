@@ -10,7 +10,7 @@ from typing import Optional, AsyncGenerator
 from fastapi import FastAPI, UploadFile, File, Query, HTTPException, status, Request
 import jax
 import jax.numpy as jnp
-from whisper_jax.pipeline_online import FlaxWhisperOnlinePipeline
+from whisper_jax.pipelines.online import FlaxWhisperOnlinePipeline
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)

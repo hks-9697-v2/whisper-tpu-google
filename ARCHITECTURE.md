@@ -2,13 +2,40 @@
 
 This document provides a comprehensive architectural analysis of the three distinct pipelines used in the `whisper-on-jax` project. It details their specific use cases, design patterns, and the optimization strategies employed for high-performance audio transcription on **TPU v6e**.
 
-## 1. Overview of Pipelines
+## 1. Repository & Package Structure (vLLM Style)
+
+```text
+whisper_jax/
+├── kernels/                        # Hardware-tuned Pallas TPU kernels & adapters
+│   ├── flywheel/                   # FlyWheel Pallas Flash Attention & KV-Cache kernels
+│   ├── ragged_paged_attention/     # Tokamax Ragged Paged Attention v3 (hd=64) kernel
+│   └── splash_attention/           # Tokamax Splash Attention Pallas kernel
+├── layers/                         # Flax Linen building blocks & attention wrappers
+│   ├── attention.py                # Standard & Splash FlaxWhisperAttention modules
+│   ├── linear.py                   # DenseGeneral, Embed, LayerNorm, sharding helpers
+│   └── ragged_paged_attention.py   # Ragged Paged Attention Linen module
+├── models/                         # Model architectures & fused encode/decode loops
+│   └── whisper.py                  # FlaxWhisperForConditionalGeneration
+├── pipelines/                      # Batching, streaming, and online serving pipelines
+│   ├── short_audio.py              # Offline short-audio batch pipeline
+│   ├── long_audio.py               # Offline long-audio streaming/chunking pipeline
+│   ├── long_audio_seek.py          # Long-audio seek pipeline
+│   └── online.py                   # Asynchronous online serving pipeline (FastAPI)
+├── inputs/                         # Audio decoding & Mel-spectrogram feature extraction
+│   ├── audio_loader.py             # Python ctypes bindings & ring-buffer batch loader
+│   └── rust_audio/                 # Native C/Rust FFmpeg + Slaney Mel filterbank engine
+└── distributed/                    # Sharding & distributed state management
+    ├── partitioner.py              # PjitPartitioner
+    └── train_state.py              # InferenceState
+```
+
+## 2. Overview of Pipelines
 
 | Pipeline | File | Primary Use Case | Key Characteristic |
 | :--- | :--- | :--- | :--- |
-| **Standard Batch** | `pipeline.py` | Offline benchmarking of short audio clips (<30s). | High-throughput batch processing of list inputs. |
-| **Long Audio** | `pipeline_long_audio.py` | Offline transcription of long files (e.g., 1 hour+). | **Streaming** chunking with overlap (stride) and timestamp alignment. |
-| **Online / Serving** | `pipeline_online.py` | Production API serving (FastAPI). | Asynchronous, non-blocking, hybrid Process/Thread pool architecture. |
+| **Standard Batch** | `whisper_jax/pipelines/short_audio.py` | Offline benchmarking of short audio clips (<30s). | High-throughput batch processing of list inputs. |
+| **Long Audio** | `whisper_jax/pipelines/long_audio.py` | Offline transcription of long files (e.g., 1 hour+). | **Streaming** chunking with overlap (stride) and timestamp alignment. |
+| **Online / Serving** | `whisper_jax/pipelines/online.py` | Production API serving (FastAPI). | Asynchronous, non-blocking, hybrid Process/Thread pool architecture. |
 
 ---
 

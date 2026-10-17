@@ -32,7 +32,7 @@ from rich.panel import Panel
 from transformers.utils import logging
 
 # ===== Local/Project Imports =====
-from whisper_jax.pipeline_long_audio import create_pipeline as create_long_audio_pipeline
+from whisper_jax.pipelines.long_audio import create_pipeline as create_long_audio_pipeline
 
 # --- Configuration ---
 console = Console()
@@ -123,7 +123,6 @@ if __name__ == "__main__":
             checkpoint=args.model_id,
             dtype=jnp.bfloat16,
             batch_size=args.batch_size,
-            encoder_attention_implementation="splash",
             skip_special_tokens=True,
         )
 

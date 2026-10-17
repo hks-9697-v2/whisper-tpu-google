@@ -14,10 +14,17 @@ common:
 
   # --- Attention Mechanism ---
   # Description: The self-attention implementation to use in the model's encoder and decoder.
-  # Options: "original", "splash", "flash", "local".
-  # Impact: "splash" or "flash" are highly optimized implementations that can significantly improve performance (higher RTFx) on compatible hardware (like TPUs) with minimal to no impact on accuracy. "original" is the safe, default implementation.
-  encoder_attention_implementation: "splash"
+  # Encoder Options: "flywheel" (FlyWheel Pallas Flash Attention - fastest), "splash" (Tokamax Splash Attention), "original" (XLA standard).
+  # Decoder Options: "original" / "mega" (XLA fused 2-stage KV cache - fastest), "flywheel" (FlyWheel Pallas contiguous KV-cache), "flywheel_paged" (FlyWheel Pallas paged KV-cache), "rpa" (Tokamax Ragged Paged Attention v3).
+  # Impact: "flywheel" and "splash" use hardware-tuned Pallas block sizes automatically selected per TPU generation (v7x vs v6e).
+  encoder_attention_implementation: "flywheel"
   decoder_attention_implementation: "original"
+
+  # --- Feature Extraction Backend ---
+  # Description: Where to compute the log-Mel spectrogram features from raw audio waveforms.
+  # Options: "cpu", "tpu"
+  # Impact: "cpu" offloads STFT + Slaney Mel filterbank + log10 compression to the native C/Rust thread pool and transfers compact bfloat16 (B, 3000, 128) Mel spectrograms to TPU (8x less host-to-device bandwidth). "tpu" transfers raw float32 waveforms to TPU and runs STFT + Mel extraction inside the pmap-compiled JAX function.
+  feature_extraction_backend: "cpu"
 
   # --- Batching and Chunking ---
   # Description: The global default batch size for inference. The pipeline will try to group this many audio chunks together.

@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import librosa
 from rich.console import Console
 
-from whisper_jax.pipeline import create_pipeline
+from whisper_jax.pipelines.short_audio import create_pipeline
 
 # --- Suppress informational warnings from the transformers library ---
 warnings.filterwarnings("ignore", category=UserWarning, module="transformers")

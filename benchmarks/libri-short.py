@@ -16,7 +16,7 @@ from rich.table import Table
 from transformers.utils import logging
 
 # ===== Local/Project Imports =====
-from whisper_jax.pipeline import create_pipeline
+from whisper_jax.pipelines.short_audio import create_pipeline
 
 # --- Configuration ---
 console = Console()
@@ -177,7 +177,6 @@ if __name__ == "__main__":
             checkpoint=args.model_id, 
             dtype=jnp.bfloat16, 
             batch_size=args.batch_size,
-            encoder_attention_implementation="splash",
             skip_special_tokens=True,
         )
         # --- Enable Early Stopping ---
