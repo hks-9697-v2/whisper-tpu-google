@@ -57,6 +57,9 @@ from whisper_jax import layers
 from whisper_jax.layers import with_sharding_constraint
 from .attention_variants import FlaxWhisperAttention, FlaxWhisperAttentionSplash
 from .ragged_paged_attention_module import FlaxWhisperRaggedPagedAttention
+from .splash_adapter import splash_attention_adapter
+from .tokamax_rpa_hd64 import ragged_paged_attention_hd64, get_kv_cache_shape
+from transformers.generation.flax_utils import FlaxGreedySearchOutput
 
 logger = logging.get_logger(__name__)
 
@@ -1428,6 +1431,423 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
             **kwargs,
         )
 
+    @staticmethod
+    def prepare_fast_params(params, config: WhisperConfig, dtype=jnp.bfloat16, generation_config=None):
+        p = unfreeze(params)
+        if "_fast" in p:
+            return freeze(p)
+        d_model = config.d_model
+        enc_heads = config.encoder_attention_heads
+        enc_hd = d_model // enc_heads
+        dec_heads = config.decoder_attention_heads
+        dec_hd = d_model // dec_heads
+        sm_scale = float(dec_hd ** -0.5)
+
+        enc = p["model"]["encoder"]
+        ep = {
+            "conv1_w": enc["conv1"]["kernel"].astype(dtype),
+            "conv1_b": enc["conv1"]["bias"].astype(dtype),
+            "conv2_w": enc["conv2"]["kernel"].astype(dtype),
+            "conv2_b": enc["conv2"]["bias"].astype(dtype),
+            "embed_pos": enc["embed_positions"]["embedding"].astype(dtype),
+            "ln_scale": enc["layer_norm"]["scale"].astype(dtype),
+            "ln_bias": enc["layer_norm"]["bias"].astype(dtype),
+        }
+        enc_sm_scale = float((d_model // config.encoder_attention_heads) ** -0.5)
+        enc_layers = []
+        for i in range(config.encoder_layers):
+            l = enc["layers"][str(i)]
+            enc_layers.append({
+                "sa_ln_s": l["self_attn_layer_norm"]["scale"].astype(dtype),
+                "sa_ln_b": l["self_attn_layer_norm"]["bias"].astype(dtype),
+                "wq": (l["self_attn"]["q_proj"]["kernel"].astype(jnp.float32) * enc_sm_scale).astype(dtype),
+                "bq": (l["self_attn"]["q_proj"]["bias"].astype(jnp.float32) * enc_sm_scale).astype(dtype),
+                "wk": l["self_attn"]["k_proj"]["kernel"].astype(dtype),
+                "wv": l["self_attn"]["v_proj"]["kernel"].astype(dtype),
+                "bv": l["self_attn"]["v_proj"]["bias"].astype(dtype),
+                "w_out": l["self_attn"]["out_proj"]["kernel"].astype(dtype),
+                "b_out": l["self_attn"]["out_proj"]["bias"].astype(dtype),
+                "ffn_ln_s": l["final_layer_norm"]["scale"].astype(dtype),
+                "ffn_ln_b": l["final_layer_norm"]["bias"].astype(dtype),
+                "fc1_w": l["fc1"]["kernel"].astype(dtype),
+                "fc1_b": l["fc1"]["bias"].astype(dtype),
+                "fc2_w": l["fc2"]["kernel"].astype(dtype),
+                "fc2_b": l["fc2"]["bias"].astype(dtype),
+            })
+        ep["stacked"] = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *enc_layers)
+
+        dec = p["model"]["decoder"]
+        embed_tokens = dec["embed_tokens"]["embedding"].astype(dtype)
+        vocab_size = embed_tokens.shape[0]
+        padded_vocab = ((vocab_size + 127) // 128) * 128
+        embed_tokens_pad = jnp.pad(embed_tokens, ((0, padded_vocab - vocab_size), (0, 0)))
+        lm_head_w = jnp.swapaxes(embed_tokens_pad, 0, 1)
+
+        suppress_tokens = getattr(generation_config, "suppress_tokens", None) if generation_config is not None else None
+        if suppress_tokens is None:
+            suppress_tokens = getattr(config, "suppress_tokens", None)
+        begin_suppress_tokens = (
+            getattr(generation_config, "begin_suppress_tokens", None) if generation_config is not None else None
+        )
+        if begin_suppress_tokens is None:
+            begin_suppress_tokens = getattr(config, "begin_suppress_tokens", None)
+
+        sup_bias = jnp.zeros((padded_vocab,), dtype=dtype).at[vocab_size:].set(-jnp.inf)
+        if suppress_tokens is not None and len(suppress_tokens) > 0:
+            sup_bias = sup_bias.at[jnp.array(list(suppress_tokens), dtype=jnp.int32)].set(-jnp.inf)
+        beg_bias = sup_bias
+        if begin_suppress_tokens is not None and len(begin_suppress_tokens) > 0:
+            beg_bias = beg_bias.at[jnp.array(list(begin_suppress_tokens), dtype=jnp.int32)].set(-jnp.inf)
+
+        dp = {
+            "embed_tokens": embed_tokens,
+            "embed_tokens_pad": embed_tokens_pad,
+            "lm_head_w": lm_head_w,
+            "sup_bias": sup_bias,
+            "beg_bias": beg_bias,
+            "embed_pos": dec["embed_positions"]["embedding"].astype(dtype),
+            "ln_scale": dec["layer_norm"]["scale"].astype(dtype),
+            "ln_bias": dec["layer_norm"]["bias"].astype(dtype),
+        }
+        dec_layers = []
+        for i in range(config.decoder_layers):
+            l = dec["layers"][str(i)]
+            sa_wq = l["self_attn"]["q_proj"]["kernel"].astype(dtype).reshape(d_model, dec_heads, dec_hd)
+            sa_wk = l["self_attn"]["k_proj"]["kernel"].astype(dtype).reshape(d_model, dec_heads, dec_hd)
+            sa_wv = l["self_attn"]["v_proj"]["kernel"].astype(dtype).reshape(d_model, dec_heads, dec_hd)
+            sa_bq = l["self_attn"]["q_proj"]["bias"].astype(dtype).reshape(dec_heads, dec_hd)
+            sa_bk = jnp.zeros((dec_heads, dec_hd), dtype=dtype)
+            sa_bv = l["self_attn"]["v_proj"]["bias"].astype(dtype).reshape(dec_heads, dec_hd)
+
+            sa_wq_scaled = (sa_wq.astype(jnp.float32) * sm_scale).astype(dtype)
+            sa_bq_scaled = (sa_bq.astype(jnp.float32) * sm_scale).astype(dtype)
+
+            ca_wq = l["encoder_attn"]["q_proj"]["kernel"].astype(dtype).reshape(d_model, dec_heads, dec_hd)
+            ca_bq = l["encoder_attn"]["q_proj"]["bias"].astype(dtype).reshape(dec_heads, dec_hd)
+            ca_wq_scaled = (ca_wq.astype(jnp.float32) * sm_scale).astype(dtype)
+            ca_bq_scaled = (ca_bq.astype(jnp.float32) * sm_scale).astype(dtype)
+
+            ca_wk = l["encoder_attn"]["k_proj"]["kernel"].astype(dtype).reshape(d_model, dec_heads, dec_hd)
+            ca_wv = l["encoder_attn"]["v_proj"]["kernel"].astype(dtype).reshape(d_model, dec_heads, dec_hd)
+            ca_bk = jnp.zeros((dec_heads, dec_hd), dtype=dtype)
+            ca_bv = l["encoder_attn"]["v_proj"]["bias"].astype(dtype).reshape(dec_heads, dec_hd)
+
+            dec_layers.append({
+                "sa_ln_s": l["self_attn_layer_norm"]["scale"].astype(dtype),
+                "sa_ln_b": l["self_attn_layer_norm"]["bias"].astype(dtype),
+                "sa_w_qkv": jnp.stack([sa_wq, sa_wk, sa_wv], axis=1),
+                "sa_b_qkv": jnp.stack([sa_bq, sa_bk, sa_bv], axis=0),
+                "sa_w_qkv_scaled": jnp.stack([sa_wq_scaled, sa_wk, sa_wv], axis=1),
+                "sa_b_qkv_scaled": jnp.stack([sa_bq_scaled, sa_bk, sa_bv], axis=0),
+                "sa_w_out": l["self_attn"]["out_proj"]["kernel"].astype(dtype).reshape(dec_heads, dec_hd, d_model),
+                "sa_b_out": l["self_attn"]["out_proj"]["bias"].astype(dtype),
+                "ca_ln_s": l["encoder_attn_layer_norm"]["scale"].astype(dtype),
+                "ca_ln_b": l["encoder_attn_layer_norm"]["bias"].astype(dtype),
+                "ca_w_q": ca_wq,
+                "ca_b_q": ca_bq,
+                "ca_w_q_scaled": ca_wq_scaled,
+                "ca_b_q_scaled": ca_bq_scaled,
+                "ca_w_k": ca_wk,
+                "ca_w_v": ca_wv,
+                "ca_b_v": ca_bv,
+                "ca_w_kv": jnp.stack([ca_wk, ca_wv], axis=1),
+                "ca_b_kv": jnp.stack([ca_bk, ca_bv], axis=0),
+                "ca_w_out": l["encoder_attn"]["out_proj"]["kernel"].astype(dtype).reshape(dec_heads, dec_hd, d_model),
+                "ca_b_out": l["encoder_attn"]["out_proj"]["bias"].astype(dtype),
+                "ffn_ln_s": l["final_layer_norm"]["scale"].astype(dtype),
+                "ffn_ln_b": l["final_layer_norm"]["bias"].astype(dtype),
+                "fc1_w": l["fc1"]["kernel"].astype(dtype),
+                "fc1_b": l["fc1"]["bias"].astype(dtype),
+                "fc2_w": l["fc2"]["kernel"].astype(dtype),
+                "fc2_b": l["fc2"]["bias"].astype(dtype),
+            })
+        dp["layers"] = dec_layers
+        return freeze({"model": p["model"], "_fast": {"encoder": ep, "decoder": dp}})
+
+    @staticmethod
+    def _fast_layer_norm(x, scale, bias, dtype=jnp.bfloat16, eps=1e-5):
+        xf = x.astype(jnp.float32)
+        mean = jnp.mean(xf, axis=-1, keepdims=True)
+        mean2 = jnp.mean(lax.square(xf), axis=-1, keepdims=True)
+        var = mean2 - lax.square(mean)
+        mul = lax.rsqrt(var + eps) * scale.astype(dtype)
+        y = (xf - mean) * mul + bias.astype(dtype)
+        return y.astype(dtype)
+
+    def _fast_encode(self, input_features, ep):
+        dtype = self.dtype
+        d_model = self.config.d_model
+        num_heads = self.config.encoder_attention_heads
+        head_dim = d_model // num_heads
+        seq_len = self.config.max_source_positions
+
+        x = input_features.astype(dtype)
+        if x.shape[1] == self.config.num_mel_bins:
+            x = x.transpose(0, 2, 1)
+        dn = lax.conv_dimension_numbers(x.shape, ep["conv1_w"].shape, ("NHC", "HIO", "NHC"))
+        x = lax.conv_general_dilated(x, ep["conv1_w"], (1,), ((1, 1),), dimension_numbers=dn) + ep["conv1_b"][None, None, :]
+        x = jax.nn.gelu(x, approximate=False)
+        x = lax.conv_general_dilated(x, ep["conv2_w"], (2,), ((1, 1),), dimension_numbers=dn) + ep["conv2_b"][None, None, :]
+        x = jax.nn.gelu(x, approximate=False)
+        x = x + ep["embed_pos"][None, :, :]
+
+        def enc_layer_body(carry, lp):
+            B = carry.shape[0]
+            ln1 = self._fast_layer_norm(carry, lp["sa_ln_s"], lp["sa_ln_b"], dtype)
+            q = (jnp.dot(ln1, lp["wq"]) + lp["bq"]).reshape(B, seq_len, num_heads, head_dim)
+            k = jnp.dot(ln1, lp["wk"]).reshape(B, seq_len, num_heads, head_dim)
+            v = (jnp.dot(ln1, lp["wv"]) + lp["bv"]).reshape(B, seq_len, num_heads, head_dim)
+            attn = splash_attention_adapter(q, k, v, causal=False, scale_query=False).reshape(B, seq_len, d_model)
+            carry = carry + jnp.dot(attn, lp["w_out"]) + lp["b_out"]
+            ln2 = self._fast_layer_norm(carry, lp["ffn_ln_s"], lp["ffn_ln_b"], dtype)
+            ffn = jax.nn.gelu(jnp.dot(ln2, lp["fc1_w"]) + lp["fc1_b"], approximate=False)
+            return carry + jnp.dot(ffn, lp["fc2_w"]) + lp["fc2_b"], None
+
+        x, _ = lax.scan(enc_layer_body, x, ep["stacked"])
+        return self._fast_layer_norm(x, ep["ln_scale"], ep["ln_bias"], dtype)
+
+    def _fast_decode_mega(
+        self,
+        enc_hidden,
+        dp,
+        forced_decoder_ids,
+        generation_config,
+        max_length: int,
+        is_dummy: Optional[jnp.ndarray] = None,
+        eos_token_id: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        decoder_start_token_id: Optional[int] = None,
+    ):
+        B = enc_hidden.shape[0]
+        dtype = self.dtype
+        num_layers = self.config.decoder_layers
+        num_heads = self.config.decoder_attention_heads
+        head_dim = self.config.d_model // num_heads
+        cache_len = ((max_length + 127) // 128) * 128
+        stage1_limit = min(64, max_length)
+        stage1_cache_len = 64 if max_length <= 64 else 64
+
+        cross_k, cross_v = [], []
+        for i in range(num_layers):
+            lp = dp["layers"][i]
+            k_i = jnp.einsum("bsd,dhk->bhks", enc_hidden, lp["ca_w_k"])
+            v_i = jnp.einsum("bsd,dhk->bhks", enc_hidden, lp["ca_w_v"]) + lp["ca_b_v"][None, :, :, None]
+            cross_k.append(k_i)
+            cross_v.append(v_i)
+
+        force_arr = jnp.full((4,), -1, dtype=jnp.int32)
+        if forced_decoder_ids is not None:
+            for idx, tok in forced_decoder_ids:
+                if idx < 4 and tok is not None and tok >= 0:
+                    force_arr = force_arr.at[idx].set(int(tok))
+
+        start_tok = decoder_start_token_id if decoder_start_token_id is not None else self.config.decoder_start_token_id
+        eos_tok = eos_token_id if eos_token_id is not None else self.config.eos_token_id
+        pad_tok = pad_token_id if pad_token_id is not None else self.config.pad_token_id
+
+        seqs_T = jnp.full((max_length, B), pad_tok, dtype=jnp.int32)
+        running_token = jnp.full((B,), start_tok, dtype=jnp.int32)
+        seqs_T = seqs_T.at[0].set(running_token)
+        is_finished = jnp.zeros((B,), dtype=jnp.bool_)
+        if is_dummy is None:
+            is_dummy = jnp.zeros((B,), dtype=jnp.bool_)
+
+        def make_step_fns(step_limit: int, cur_cache_len: int):
+            arange_cur = jnp.arange(cur_cache_len, dtype=jnp.int32)[None, None, :]
+
+            def cond_fn(state):
+                cur_len, _, _, is_fin, _, _ = state
+                return jnp.logical_and(cur_len < step_limit, ~jnp.all(is_fin))
+
+            def body_fn(state):
+                cur_len, s_T, run_tok, is_fin, kc, vc = state
+                pos_idx = cur_len - 1
+                x = dp["embed_tokens_pad"][run_tok] + dp["embed_pos"][pos_idx][None, :]
+                mask = arange_cur < cur_len
+                new_kc, new_vc = [], []
+                for i in range(num_layers):
+                    lp = dp["layers"][i]
+                    ln1 = self._fast_layer_norm(x, lp["sa_ln_s"], lp["sa_ln_b"], dtype)
+                    qkv = jnp.einsum("bd,dchk->bchk", ln1, lp["sa_w_qkv_scaled"]) + lp["sa_b_qkv_scaled"][None, ...]
+                    q = qkv[:, 0]
+                    k_cur = lax.dynamic_update_index_in_dim(kc[i], qkv[:, 1], pos_idx, axis=0)
+                    v_cur = lax.dynamic_update_index_in_dim(vc[i], qkv[:, 2], pos_idx, axis=0)
+                    new_kc.append(k_cur)
+                    new_vc.append(v_cur)
+                    sa_logits = jnp.einsum("bhd,sbhd->bhs", q, k_cur, preferred_element_type=jnp.float32)
+                    sa_logits = jnp.where(mask, sa_logits, jnp.array(-1e9, dtype=jnp.float32))
+                    sa_probs = jax.nn.softmax(sa_logits, axis=-1).astype(dtype)
+                    sa_out = jnp.einsum("bhs,sbhd->bhd", sa_probs, v_cur)
+                    x = x + jnp.einsum("bhd,hde->be", sa_out, lp["sa_w_out"]) + lp["sa_b_out"][None, :]
+
+                    ln2 = self._fast_layer_norm(x, lp["ca_ln_s"], lp["ca_ln_b"], dtype)
+                    ca_q = jnp.einsum("bd,dhk->bhk", ln2, lp["ca_w_q_scaled"]) + lp["ca_b_q_scaled"][None, :]
+                    ca_logits = jnp.einsum("bhd,bhds->bhs", ca_q, cross_k[i], preferred_element_type=jnp.float32)
+                    ca_probs = jax.nn.softmax(ca_logits, axis=-1).astype(dtype)
+                    ca_ctx = jnp.einsum("bhs,bhds->bhd", ca_probs, cross_v[i])
+                    x = x + jnp.einsum("bhd,hde->be", ca_ctx, lp["ca_w_out"]) + lp["ca_b_out"][None, :]
+
+                    ln3 = self._fast_layer_norm(x, lp["ffn_ln_s"], lp["ffn_ln_b"], dtype)
+                    ffn = jax.nn.gelu(jnp.dot(ln3, lp["fc1_w"]) + lp["fc1_b"], approximate=False)
+                    x = x + jnp.dot(ffn, lp["fc2_w"]) + lp["fc2_b"]
+
+                x = self._fast_layer_norm(x, dp["ln_scale"], dp["ln_bias"], dtype)
+                bias = jnp.where(cur_len == 1, dp["beg_bias"], dp["sup_bias"])
+                logits = jnp.dot(x, dp["lm_head_w"]) + bias[None, :]
+
+                pred_tok = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+                force_tok = jnp.where(cur_len < 4, force_arr[cur_len], -1)
+                next_tok = jnp.where(force_tok >= 0, jnp.broadcast_to(force_tok, (B,)), pred_tok)
+                next_tok = jnp.where(is_fin, pad_tok, next_tok)
+                next_is_fin = is_fin | (next_tok == eos_tok) | is_dummy
+                next_s_T = lax.dynamic_update_index_in_dim(s_T, next_tok, cur_len, axis=0)
+                return (cur_len + 1, next_s_T, next_tok, next_is_fin, new_kc, new_vc)
+
+            return cond_fn, body_fn
+
+        k_caches_1 = [jnp.zeros((stage1_cache_len, B, num_heads, head_dim), dtype=dtype) for _ in range(num_layers)]
+        v_caches_1 = [jnp.zeros((stage1_cache_len, B, num_heads, head_dim), dtype=dtype) for _ in range(num_layers)]
+        cond1, body1 = make_step_fns(stage1_limit, stage1_cache_len)
+        cur_len1, s_T1, run_tok1, is_fin1, kc1, vc1 = lax.while_loop(
+            cond1,
+            body1,
+            (jnp.array(1, dtype=jnp.int32), seqs_T, running_token, is_finished, k_caches_1, v_caches_1),
+        )
+
+        if max_length <= stage1_limit:
+            return s_T1.T
+
+        cond2, body2 = make_step_fns(max_length, cache_len)
+
+        def run_stage2(state1):
+            c_len, s_t, r_tok, fin, k1, v1 = state1
+            pad_len = cache_len - stage1_cache_len
+            k2 = [jnp.pad(k, ((0, pad_len), (0, 0), (0, 0), (0, 0))) for k in k1]
+            v2 = [jnp.pad(v, ((0, pad_len), (0, 0), (0, 0), (0, 0))) for v in v1]
+            _, final_s_t, _, _, _, _ = lax.while_loop(cond2, body2, (c_len, s_t, r_tok, fin, k2, v2))
+            return final_s_t
+
+        final_s_T = lax.cond(
+            jnp.logical_and(cur_len1 < max_length, ~jnp.all(is_fin1)),
+            run_stage2,
+            lambda state1: state1[1],
+            (cur_len1, s_T1, run_tok1, is_fin1, kc1, vc1),
+        )
+        return final_s_T.T
+
+    def _fast_decode_rpa(
+        self,
+        enc_hidden,
+        dp,
+        forced_decoder_ids,
+        generation_config,
+        max_length: int,
+        is_dummy: Optional[jnp.ndarray] = None,
+        eos_token_id: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        decoder_start_token_id: Optional[int] = None,
+    ):
+        B = enc_hidden.shape[0]
+        dtype = self.dtype
+        num_layers = self.config.decoder_layers
+        num_heads = self.config.decoder_attention_heads
+        head_dim = self.config.d_model // num_heads
+        sm_scale = float(1.0 / (head_dim ** 0.5))
+
+        cross_k, cross_v = [], []
+        for i in range(num_layers):
+            lp = dp["layers"][i]
+            k_i = jnp.einsum("bsd,dhk->bhks", enc_hidden, lp["ca_w_k"])
+            v_i = jnp.einsum("bsd,dhk->bhks", enc_hidden, lp["ca_w_v"]) + lp["ca_b_v"][None, :, :, None]
+            cross_k.append(k_i)
+            cross_v.append(v_i)
+
+        page_size = 64
+        pages_per_seq = (max_length + page_size - 1) // page_size
+        total_pages = B * pages_per_seq
+        cache_shape = get_kv_cache_shape(total_pages, page_size, num_heads, head_dim, dtype)
+        kv_caches = [jnp.zeros(cache_shape, dtype=dtype) for _ in range(num_layers)]
+        page_indices = jnp.arange(total_pages, dtype=jnp.int32)
+        cu_q_lens = jnp.arange(0, B + 1, dtype=jnp.int32)
+        distribution = jnp.array([B, B, B], dtype=jnp.int32)
+
+        force_arr = jnp.full((4,), -1, dtype=jnp.int32)
+        if forced_decoder_ids is not None:
+            for idx, tok in forced_decoder_ids:
+                if idx < 4 and tok is not None and tok >= 0:
+                    force_arr = force_arr.at[idx].set(int(tok))
+
+        start_tok = decoder_start_token_id if decoder_start_token_id is not None else self.config.decoder_start_token_id
+        eos_tok = eos_token_id if eos_token_id is not None else self.config.eos_token_id
+        pad_tok = pad_token_id if pad_token_id is not None else self.config.pad_token_id
+
+        seqs_T = jnp.full((max_length, B), pad_tok, dtype=jnp.int32)
+        running_token = jnp.full((B,), start_tok, dtype=jnp.int32)
+        seqs_T = seqs_T.at[0].set(running_token)
+        is_finished = jnp.zeros((B,), dtype=jnp.bool_)
+        if is_dummy is None:
+            is_dummy = jnp.zeros((B,), dtype=jnp.bool_)
+
+        def cond_fn(state):
+            cur_len, _, _, is_fin, _ = state
+            return jnp.logical_and(cur_len < max_length, ~jnp.all(is_fin))
+
+        def body_fn(state):
+            cur_len, s_T, run_tok, is_fin, caches = state
+            pos_idx = cur_len - 1
+            x = dp["embed_tokens_pad"][run_tok] + dp["embed_pos"][pos_idx][None, :]
+            kv_lens = jnp.full((B,), cur_len, dtype=jnp.int32)
+            new_caches = []
+            for i in range(num_layers):
+                lp = dp["layers"][i]
+                ln1 = self._fast_layer_norm(x, lp["sa_ln_s"], lp["sa_ln_b"], dtype)
+                qkv = jnp.einsum("bd,dchk->bchk", ln1, lp["sa_w_qkv"]) + lp["sa_b_qkv"][None, ...]
+                sa_out, new_cache = ragged_paged_attention_hd64(
+                    qkv[:, 0],
+                    qkv[:, 1],
+                    qkv[:, 2],
+                    caches[i],
+                    kv_lens=kv_lens,
+                    page_indices=page_indices,
+                    cu_q_lens=cu_q_lens,
+                    distribution=distribution,
+                    sm_scale=sm_scale,
+                    num_kv_pages_per_block=1,
+                    num_queries_per_block=1,
+                )
+                new_caches.append(new_cache)
+                x = x + jnp.einsum("bhd,hde->be", sa_out, lp["sa_w_out"]) + lp["sa_b_out"][None, :]
+
+                ln2 = self._fast_layer_norm(x, lp["ca_ln_s"], lp["ca_ln_b"], dtype)
+                ca_q = jnp.einsum("bd,dhk->bhk", ln2, lp["ca_w_q_scaled"]) + lp["ca_b_q_scaled"][None, :]
+                ca_logits = jnp.einsum("bhd,bhds->bhs", ca_q, cross_k[i], preferred_element_type=jnp.float32)
+                ca_probs = jax.nn.softmax(ca_logits, axis=-1).astype(dtype)
+                ca_ctx = jnp.einsum("bhs,bhds->bhd", ca_probs, cross_v[i])
+                x = x + jnp.einsum("bhd,hde->be", ca_ctx, lp["ca_w_out"]) + lp["ca_b_out"][None, :]
+
+                ln3 = self._fast_layer_norm(x, lp["ffn_ln_s"], lp["ffn_ln_b"], dtype)
+                ffn = jax.nn.gelu(jnp.dot(ln3, lp["fc1_w"]) + lp["fc1_b"], approximate=False)
+                x = x + jnp.dot(ffn, lp["fc2_w"]) + lp["fc2_b"]
+
+            x = self._fast_layer_norm(x, dp["ln_scale"], dp["ln_bias"], dtype)
+            bias = jnp.where(cur_len == 1, dp["beg_bias"], dp["sup_bias"])
+            logits = jnp.dot(x, dp["lm_head_w"]) + bias[None, :]
+
+            pred_tok = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+            force_tok = jnp.where(cur_len < 4, force_arr[cur_len], -1)
+            next_tok = jnp.where(force_tok >= 0, jnp.broadcast_to(force_tok, (B,)), pred_tok)
+            next_tok = jnp.where(is_fin, pad_tok, next_tok)
+            next_is_fin = is_fin | (next_tok == eos_tok) | is_dummy
+            next_s_T = lax.dynamic_update_index_in_dim(s_T, next_tok, cur_len, axis=0)
+            return (cur_len + 1, next_s_T, next_tok, next_is_fin, new_caches)
+
+        _, final_s_T, _, _, _ = lax.while_loop(
+            cond_fn,
+            body_fn,
+            (jnp.array(1, dtype=jnp.int32), seqs_T, running_token, is_finished, kv_caches),
+        )
+        return final_s_T.T
+
     def pipeline_generate(
         self,
         input_features,
@@ -1438,6 +1858,35 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
     ):
         if generation_config is None:
             generation_config = self.generation_config
+
+        if not return_timestamps and (self.config.d_model // self.config.decoder_attention_heads) == 64:
+            params = kwargs.get("params") or self.params
+            if "_fast" not in params:
+                params = self.prepare_fast_params(
+                    params, self.config, dtype=self.dtype, generation_config=generation_config
+                )
+            fp = params["_fast"]
+            max_length = kwargs.get("max_length") or generation_config.max_length
+            attention_mask = kwargs.get("attention_mask")
+            is_dummy = jnp.all(input_features == input_features[:, :1, :1], axis=(1, 2))
+            if attention_mask is not None:
+                is_dummy = jnp.logical_or(is_dummy, attention_mask[:, 0] == 0)
+
+            enc_hidden = self._fast_encode(input_features, fp["encoder"])
+            dec_impl = getattr(self, "decoder_attention_implementation", "original")
+            decode_fn = self._fast_decode_rpa if dec_impl in ("paged", "ragged_paged") else self._fast_decode_mega
+            sequences = decode_fn(
+                enc_hidden,
+                fp["decoder"],
+                forced_decoder_ids=forced_decoder_ids,
+                generation_config=generation_config,
+                max_length=max_length,
+                is_dummy=is_dummy,
+                eos_token_id=kwargs.get("eos_token_id", self.config.eos_token_id),
+                pad_token_id=kwargs.get("pad_token_id", self.config.pad_token_id),
+                decoder_start_token_id=kwargs.get("decoder_start_token_id", self.config.decoder_start_token_id),
+            )
+            return FlaxGreedySearchOutput(sequences=sequences)
 
         # override the generation config forced decoder ids in preference of the ones we have set
         generation_config.forced_decoder_ids = None

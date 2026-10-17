@@ -1,58 +1,57 @@
+import jax
 import jax.numpy as jnp
-import numpy as np
-from typing import Optional
+from typing import Optional, Tuple
+from .tokamax_rpa_hd64 import ragged_paged_attention_hd64, get_kv_cache_shape
 
-# Stub import for EasyDeL kernel
-# In production, this must be installed: pip install easydel
-try:
-    from ejkernel.modules import ragged_page_attention
-except ImportError:
-    ragged_page_attention = None
 
 def ragged_paged_attention_adapter(
     query: jnp.ndarray,
+    key: jnp.ndarray,
+    value: jnp.ndarray,
     kv_pages: jnp.ndarray,
     pages_tables: jnp.ndarray,
     context_lens: jnp.ndarray,
-    num_seqs: int,
-    head_dim: int,
-    softmax_scale: float = None
-):
+    cu_q_lens: Optional[jnp.ndarray] = None,
+    distribution: Optional[jnp.ndarray] = None,
+    softmax_scale: Optional[float] = None,
+    num_kv_pages_per_block: Optional[int] = 1,
+    num_queries_per_block: Optional[int] = 1,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Adapter for EasyDeL's Ragged Paged Attention Kernel.
-    Forces the use of the Pallas kernel for TPU decoding.
+    Adapter for Tokamax Ragged Paged Attention (head_dim=64) Pallas Kernel on TPU.
     """
-    if ragged_page_attention is None:
-        raise ImportError("EasyDeL (ejkernel) not found. Please install it to use Ragged Paged Attention.")
-
-    # Query: [Batch, 1, Heads, Dim]
     batch, q_len, num_heads, dim = query.shape
-    
-    # Flatten Query for Kernel: [Total_Tokens, Heads, Dim]
-    query_ragged = query.reshape(-1, num_heads, dim)
+    num_kv_heads = key.shape[2]
 
-    # Metadata
-    # query_start_loc is trivial for decoding (1 token per seq): [0, 1, 2, ... N]
-    query_start_loc = jnp.arange(batch + 1, dtype=jnp.int32)
-    
-    num_seqs_flat = jnp.array([num_seqs], dtype=jnp.int32).reshape(-1)
+    query_ragged = query.reshape(-1, num_heads, dim)
+    key_ragged = key.reshape(-1, num_kv_heads, dim)
+    value_ragged = value.reshape(-1, num_kv_heads, dim)
+
+    if cu_q_lens is None:
+        cu_q_lens = jnp.arange(0, (batch + 1) * q_len, q_len, dtype=jnp.int32)
+    if distribution is None:
+        if q_len == 1:
+            distribution = jnp.array([batch, batch, batch], dtype=jnp.int32)
+        else:
+            distribution = jnp.array([0, batch, batch], dtype=jnp.int32)
 
     if softmax_scale is None:
-        softmax_scale = 1.0 / jnp.sqrt(dim)
+        softmax_scale = 1.0
 
-    # Execute Kernel
-    output_ragged = ragged_page_attention(
-        query=query_ragged,
-        kv_pages=kv_pages,
-        context_lens=context_lens,
-        pages_tables=pages_tables,
-        query_start_loc=query_start_loc,
-        num_seqs=num_seqs_flat,
-        softmax_scale=softmax_scale,
-        compute_dtype=jnp.bfloat16,
-        optimized=True 
+    output_ragged, updated_kv_pages = ragged_paged_attention_hd64(
+        queries=query_ragged,
+        keys=key_ragged,
+        values=value_ragged,
+        kv_cache=kv_pages,
+        kv_lens=context_lens,
+        page_indices=pages_tables.reshape(-1),
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        sm_scale=softmax_scale,
+        chunk_prefill_size=q_len if q_len > 1 else None,
+        num_kv_pages_per_block=num_kv_pages_per_block,
+        num_queries_per_block=num_queries_per_block,
     )
 
-    # Reshape Output: [Batch, 1, Heads, Dim]
     output = output_ragged.reshape(batch, q_len, num_heads, dim)
-    return output
+    return output, updated_kv_pages
