@@ -1625,6 +1625,19 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         x, _ = lax.scan(enc_layer_body, x, ep["stacked"])
         return self._fast_layer_norm(x, ep["ln_scale"], ep["ln_bias"], dtype)
 
+    def _build_force_arr(self, forced_decoder_ids, B: int) -> jnp.ndarray:
+        if hasattr(forced_decoder_ids, "ndim"):
+            arr = jnp.asarray(forced_decoder_ids, dtype=jnp.int32)
+            if arr.ndim == 1:
+                return jnp.broadcast_to(arr[None, :4], (B, 4))
+            return arr[:, :4]
+        force_1d = jnp.full((4,), -1, dtype=jnp.int32)
+        if forced_decoder_ids is not None:
+            for idx, tok in forced_decoder_ids:
+                if idx < 4 and tok is not None and tok >= 0:
+                    force_1d = force_1d.at[idx].set(int(tok))
+        return jnp.broadcast_to(force_1d[None, :], (B, 4))
+
     def _fast_decode_mega(
         self,
         enc_hidden,
@@ -1636,6 +1649,7 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         eos_token_id: Optional[int] = None,
         pad_token_id: Optional[int] = None,
         decoder_start_token_id: Optional[int] = None,
+        return_is_fin: bool = False,
     ):
         B = enc_hidden.shape[0]
         dtype = self.dtype
@@ -1656,11 +1670,7 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
             cross_k.append(k_i)
             cross_v.append(v_i)
 
-        force_arr = jnp.full((4,), -1, dtype=jnp.int32)
-        if forced_decoder_ids is not None:
-            for idx, tok in forced_decoder_ids:
-                if idx < 4 and tok is not None and tok >= 0:
-                    force_arr = force_arr.at[idx].set(int(tok))
+        force_arr = self._build_force_arr(forced_decoder_ids, B)
 
         start_tok = decoder_start_token_id if decoder_start_token_id is not None else self.config.decoder_start_token_id
         eos_tok = eos_token_id if eos_token_id is not None else self.config.eos_token_id
@@ -1669,9 +1679,9 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         seqs_T = jnp.full((max_length, B), pad_tok, dtype=jnp.int32)
         running_token = jnp.full((B,), start_tok, dtype=jnp.int32)
         seqs_T = seqs_T.at[0].set(running_token)
-        is_finished = jnp.zeros((B,), dtype=jnp.bool_)
         if is_dummy is None:
             is_dummy = jnp.zeros((B,), dtype=jnp.bool_)
+        is_finished = is_dummy
 
         def make_step_fns(step_limit: int, cur_cache_len: int):
             arange_cur = jnp.arange(cur_cache_len, dtype=jnp.int32)[None, None, :]
@@ -1717,8 +1727,8 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
                 logits = jnp.dot(x, dp["lm_head_w"]) + bias[None, :]
 
                 pred_tok = jnp.argmax(logits, axis=-1).astype(jnp.int32)
-                force_tok = jnp.where(cur_len < 4, force_arr[cur_len], -1)
-                next_tok = jnp.where(force_tok >= 0, jnp.broadcast_to(force_tok, (B,)), pred_tok)
+                force_tok = jnp.where(cur_len < 4, force_arr[:, cur_len], -1)
+                next_tok = jnp.where(force_tok >= 0, force_tok, pred_tok)
                 next_tok = jnp.where(is_fin, pad_tok, next_tok)
                 next_is_fin = is_fin | (next_tok == eos_tok) | is_dummy
                 next_s_T = lax.dynamic_update_index_in_dim(s_T, next_tok, cur_len, axis=0)
@@ -1736,6 +1746,8 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         )
 
         if max_length <= stage1_limit:
+            if return_is_fin:
+                return s_T1.T, is_fin1
             return s_T1.T
 
         if stage2_limit >= max_length or stage2_cache_len == cache_len:
@@ -1828,11 +1840,7 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         cu_q_lens = jnp.arange(0, B + 1, dtype=jnp.int32)
         distribution = jnp.array([B, B, B], dtype=jnp.int32)
 
-        force_arr = jnp.full((4,), -1, dtype=jnp.int32)
-        if forced_decoder_ids is not None:
-            for idx, tok in forced_decoder_ids:
-                if idx < 4 and tok is not None and tok >= 0:
-                    force_arr = force_arr.at[idx].set(int(tok))
+        force_arr = self._build_force_arr(forced_decoder_ids, B)
 
         start_tok = decoder_start_token_id if decoder_start_token_id is not None else self.config.decoder_start_token_id
         eos_tok = eos_token_id if eos_token_id is not None else self.config.eos_token_id
@@ -1841,9 +1849,9 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         seqs_T = jnp.full((max_length, B), pad_tok, dtype=jnp.int32)
         running_token = jnp.full((B,), start_tok, dtype=jnp.int32)
         seqs_T = seqs_T.at[0].set(running_token)
-        is_finished = jnp.zeros((B,), dtype=jnp.bool_)
         if is_dummy is None:
             is_dummy = jnp.zeros((B,), dtype=jnp.bool_)
+        is_finished = is_dummy
 
         def cond_fn(state):
             cur_len, _, _, is_fin, _ = state
@@ -1889,8 +1897,8 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
             logits = jnp.dot(x, dp["lm_head_w"]) + bias[None, :]
 
             pred_tok = jnp.argmax(logits, axis=-1).astype(jnp.int32)
-            force_tok = jnp.where(cur_len < 4, force_arr[cur_len], -1)
-            next_tok = jnp.where(force_tok >= 0, jnp.broadcast_to(force_tok, (B,)), pred_tok)
+            force_tok = jnp.where(cur_len < 4, force_arr[:, cur_len], -1)
+            next_tok = jnp.where(force_tok >= 0, force_tok, pred_tok)
             next_tok = jnp.where(is_fin, pad_tok, next_tok)
             next_is_fin = is_fin | (next_tok == eos_tok) | is_dummy
             next_s_T = lax.dynamic_update_index_in_dim(s_T, next_tok, cur_len, axis=0)
@@ -1947,11 +1955,7 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
             kv_caches = (k_caches, v_caches)
             block_table = None
 
-        force_arr = jnp.full((4,), -1, dtype=jnp.int32)
-        if forced_decoder_ids is not None:
-            for idx, tok in forced_decoder_ids:
-                if idx < 4 and tok is not None and tok >= 0:
-                    force_arr = force_arr.at[idx].set(int(tok))
+        force_arr = self._build_force_arr(forced_decoder_ids, B)
 
         start_tok = decoder_start_token_id if decoder_start_token_id is not None else self.config.decoder_start_token_id
         eos_tok = eos_token_id if eos_token_id is not None else self.config.eos_token_id
@@ -1960,9 +1964,9 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         seqs_T = jnp.full((max_length, B), pad_tok, dtype=jnp.int32)
         running_token = jnp.full((B,), start_tok, dtype=jnp.int32)
         seqs_T = seqs_T.at[0].set(running_token)
-        is_finished = jnp.zeros((B,), dtype=jnp.bool_)
         if is_dummy is None:
             is_dummy = jnp.zeros((B,), dtype=jnp.bool_)
+        is_finished = is_dummy
 
         def cond_fn(state):
             cur_len, _, _, is_fin, _ = state
@@ -2030,8 +2034,8 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
             logits = jnp.dot(x, dp["lm_head_w"]) + bias[None, :]
 
             pred_tok = jnp.argmax(logits, axis=-1).astype(jnp.int32)
-            force_tok = jnp.where(cur_len < 4, force_arr[cur_len], -1)
-            next_tok = jnp.where(force_tok >= 0, jnp.broadcast_to(force_tok, (B,)), pred_tok)
+            force_tok = jnp.where(cur_len < 4, force_arr[:, cur_len], -1)
+            next_tok = jnp.where(force_tok >= 0, force_tok, pred_tok)
             next_tok = jnp.where(is_fin, pad_tok, next_tok)
             next_is_fin = is_fin | (next_tok == eos_tok) | is_dummy
             next_s_T = lax.dynamic_update_index_in_dim(s_T, next_tok, cur_len, axis=0)
@@ -2044,6 +2048,254 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
             (jnp.array(1, dtype=jnp.int32), seqs_T, running_token, is_finished, kv_caches),
         )
         return final_s_T.T
+
+    def pipeline_quantum_step(
+        self,
+        input_features,
+        seqs_in,
+        cur_len_in,
+        force_tokens,
+        is_dummy,
+        params=None,
+        quantum_size: int = 64,
+        max_length: int = 448,
+        encoder_attention_implementation: Optional[str] = None,
+        eos_token_id: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        decoder_start_token_id: Optional[int] = None,
+    ):
+        params = params or self.params
+        fp = params["_fast"]
+        dp = fp["decoder"]
+        B = input_features.shape[0]
+        dtype = self.dtype
+        num_layers = self.config.decoder_layers
+        num_heads = self.config.decoder_attention_heads
+        head_dim = self.config.d_model // num_heads
+
+        start_tok = decoder_start_token_id if decoder_start_token_id is not None else self.config.decoder_start_token_id
+        eos_tok = eos_token_id if eos_token_id is not None else self.config.eos_token_id
+        pad_tok = pad_token_id if pad_token_id is not None else self.config.pad_token_id
+
+        if is_dummy is None:
+            is_dummy = jnp.zeros((B,), dtype=jnp.bool_)
+        is_dummy = is_dummy | jnp.all(input_features == input_features[:, :1, :1], axis=(1, 2))
+
+        enc_impl = encoder_attention_implementation or getattr(
+            self,
+            "encoder_attention_implementation",
+            getattr(self.module, "encoder_attention_implementation", "flywheel"),
+        )
+        enc_hidden = self._fast_encode(input_features, fp["encoder"], enc_impl=enc_impl)
+        force_arr = self._build_force_arr(force_tokens, B)
+
+        cross_k, cross_v = [], []
+        for i in range(num_layers):
+            lp = dp["layers"][i]
+            k_i = jnp.einsum("bsd,dhk->bhks", enc_hidden, lp["ca_w_k"])
+            v_i = jnp.einsum("bsd,dhk->bhks", enc_hidden, lp["ca_w_v"]) + lp["ca_b_v"][None, :, :, None]
+            cross_k.append(k_i)
+            cross_v.append(v_i)
+
+        stage1_limit = min(quantum_size, max_length)
+        stage1_cache_len = 64
+        stage2_cache_len = 128
+        cache_len = ((max_length + 127) // 128) * 128
+
+        def run_pure_new_quantum(_):
+            arange_s1 = jnp.arange(stage1_cache_len, dtype=jnp.int32)[None, None, :]
+            seqs_T0 = jnp.full((stage1_limit, B), pad_tok, dtype=jnp.int32)
+            running_token = jnp.full((B,), start_tok, dtype=jnp.int32)
+            seqs_T0 = seqs_T0.at[0].set(running_token)
+            k_caches_1 = [jnp.zeros((stage1_cache_len, B, num_heads, head_dim), dtype=dtype) for _ in range(num_layers)]
+            v_caches_1 = [jnp.zeros((stage1_cache_len, B, num_heads, head_dim), dtype=dtype) for _ in range(num_layers)]
+
+            def cond1(state):
+                c_len, _, _, fin_s, _, _ = state
+                return jnp.logical_and(c_len < stage1_limit, ~jnp.all(fin_s))
+
+            def body1(state):
+                c_len, s_T, r_tok, fin_s, kc, vc = state
+                pos_idx = c_len - 1
+                x_s = dp["embed_tokens_pad"][r_tok] + dp["embed_pos"][pos_idx][None, :]
+                mask = arange_s1 < c_len
+                new_kc, new_vc = [], []
+                for i in range(num_layers):
+                    lp = dp["layers"][i]
+                    ln1 = self._fast_layer_norm(x_s, lp["sa_ln_s"], lp["sa_ln_b"], dtype)
+                    qkv = jnp.einsum("bd,dchk->bchk", ln1, lp["sa_w_qkv_scaled"]) + lp["sa_b_qkv_scaled"][None, ...]
+                    q = qkv[:, 0]
+                    k_cur = lax.dynamic_update_index_in_dim(kc[i], qkv[:, 1], pos_idx, axis=0)
+                    v_cur = lax.dynamic_update_index_in_dim(vc[i], qkv[:, 2], pos_idx, axis=0)
+                    new_kc.append(k_cur)
+                    new_vc.append(v_cur)
+                    sa_logits = jnp.einsum("bhd,sbhd->bhs", q, k_cur, preferred_element_type=jnp.float32)
+                    sa_logits = jnp.where(mask, sa_logits, jnp.array(-1e9, dtype=jnp.float32))
+                    sa_probs = jax.nn.softmax(sa_logits, axis=-1).astype(dtype)
+                    sa_out = jnp.einsum("bhs,sbhd->bhd", sa_probs, v_cur)
+                    x_s = x_s + jnp.einsum("bhd,hde->be", sa_out, lp["sa_w_out"]) + lp["sa_b_out"][None, :]
+
+                    ln2 = self._fast_layer_norm(x_s, lp["ca_ln_s"], lp["ca_ln_b"], dtype)
+                    ca_q = jnp.einsum("bd,dhk->bhk", ln2, lp["ca_w_q_scaled"]) + lp["ca_b_q_scaled"][None, :]
+                    ca_logits = jnp.einsum("bhd,bhds->bhs", ca_q, cross_k[i], preferred_element_type=jnp.float32)
+                    ca_probs = jax.nn.softmax(ca_logits, axis=-1).astype(dtype)
+                    ca_ctx = jnp.einsum("bhs,bhds->bhd", ca_probs, cross_v[i])
+                    x_s = x_s + jnp.einsum("bhd,hde->be", ca_ctx, lp["ca_w_out"]) + lp["ca_b_out"][None, :]
+
+                    ln3 = self._fast_layer_norm(x_s, lp["ffn_ln_s"], lp["ffn_ln_b"], dtype)
+                    ffn = jax.nn.gelu(jnp.dot(ln3, lp["fc1_w"]) + lp["fc1_b"], approximate=False)
+                    x_s = x_s + jnp.dot(ffn, lp["fc2_w"]) + lp["fc2_b"]
+
+                x_s = self._fast_layer_norm(x_s, dp["ln_scale"], dp["ln_bias"], dtype)
+                bias = jnp.where(c_len == 1, dp["beg_bias"], dp["sup_bias"])
+                logits = jnp.dot(x_s, dp["lm_head_w"]) + bias[None, :]
+                pred_tok = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+                force_tok = jnp.where(c_len < 4, force_arr[:, c_len], -1)
+                next_tok = jnp.where(force_tok >= 0, force_tok, pred_tok)
+                next_tok = jnp.where(fin_s, pad_tok, next_tok)
+                next_fin = fin_s | (next_tok == eos_tok) | ((c_len + 1) >= max_length) | is_dummy
+                next_s_T = lax.dynamic_update_index_in_dim(s_T, next_tok, c_len, axis=0)
+                return (c_len + 1, next_s_T, next_tok, next_fin, new_kc, new_vc)
+
+            cur_len1, s_T1, _, is_fin1, _, _ = lax.while_loop(
+                cond1,
+                body1,
+                (jnp.array(1, dtype=jnp.int32), seqs_T0, running_token, is_dummy, k_caches_1, v_caches_1),
+            )
+            seqs_out = jnp.full((B, max_length), pad_tok, dtype=jnp.int32).at[:, :stage1_limit].set(s_T1.T)
+            cur_len_out = jnp.where(is_dummy, 1, cur_len1)
+            return seqs_out, cur_len_out, is_fin1
+
+        def make_mixed_runner(prefill_cap: int, cur_cache_len: int):
+            def _run(_):
+                prefix_toks = seqs_in[:, :prefill_cap]
+                x = dp["embed_tokens_pad"][prefix_toks] + dp["embed_pos"][:prefill_cap][None, :, :]
+                idx_p = jnp.arange(prefill_cap, dtype=jnp.int32)
+                causal_mask = idx_p[None, None, :, None] >= idx_p[None, None, None, :]
+                pad_to_cache = cur_cache_len - prefill_cap
+                k_caches, v_caches = [], []
+
+                for i in range(num_layers):
+                    lp = dp["layers"][i]
+                    ln1 = self._fast_layer_norm(x, lp["sa_ln_s"], lp["sa_ln_b"], dtype)
+                    qkv = jnp.einsum("bsd,dchk->bschk", ln1, lp["sa_w_qkv_scaled"]) + lp["sa_b_qkv_scaled"][None, None, ...]
+                    q_p = qkv[:, :, 0]
+                    k_p = qkv[:, :, 1]
+                    v_p = qkv[:, :, 2]
+
+                    k_caches.append(jnp.pad(k_p, ((0, 0), (0, pad_to_cache), (0, 0), (0, 0))))
+                    v_caches.append(jnp.pad(v_p, ((0, 0), (0, pad_to_cache), (0, 0), (0, 0))))
+
+                    sa_logits = jnp.einsum("bshd,bthd->bhst", q_p, k_p, preferred_element_type=jnp.float32)
+                    sa_logits = jnp.where(causal_mask, sa_logits, jnp.array(-1e9, dtype=jnp.float32))
+                    sa_probs = jax.nn.softmax(sa_logits, axis=-1).astype(dtype)
+                    sa_out = jnp.einsum("bhst,bthd->bshd", sa_probs, v_p)
+                    x = x + jnp.einsum("bshd,hde->bse", sa_out, lp["sa_w_out"]) + lp["sa_b_out"][None, None, :]
+
+                    ln2 = self._fast_layer_norm(x, lp["ca_ln_s"], lp["ca_ln_b"], dtype)
+                    ca_q = jnp.einsum("bsd,dhk->bshk", ln2, lp["ca_w_q_scaled"]) + lp["ca_b_q_scaled"][None, None, :]
+                    ca_logits = jnp.einsum("bshd,bhdt->bhst", ca_q, cross_k[i], preferred_element_type=jnp.float32)
+                    ca_probs = jax.nn.softmax(ca_logits, axis=-1).astype(dtype)
+                    ca_ctx = jnp.einsum("bhst,bhdt->bshd", ca_probs, cross_v[i])
+                    x = x + jnp.einsum("bshd,hde->bse", ca_ctx, lp["ca_w_out"]) + lp["ca_b_out"][None, None, :]
+
+                    ln3 = self._fast_layer_norm(x, lp["ffn_ln_s"], lp["ffn_ln_b"], dtype)
+                    ffn = jax.nn.gelu(jnp.dot(ln3, lp["fc1_w"]) + lp["fc1_b"], approximate=False)
+                    x = x + jnp.dot(ffn, lp["fc2_w"]) + lp["fc2_b"]
+
+                cur_len0 = jnp.maximum(cur_len_in, 1)
+                row_step_limit = jnp.minimum(((cur_len0 // quantum_size) + 1) * quantum_size, max_length)
+                batch_iota = jnp.arange(B, dtype=jnp.int32)
+                seqs0 = seqs_in.at[:, 0].set(jnp.where(cur_len0 == 1, start_tok, seqs_in[:, 0]))
+                run_tok0 = seqs0[batch_iota, cur_len0 - 1]
+                is_fin0 = is_dummy | (cur_len0 >= max_length)
+                arange_cur = jnp.arange(cur_cache_len, dtype=jnp.int32)[None, None, :]
+
+                def cond_m(state):
+                    c_len, _, _, fin_s, _, _ = state
+                    return ~jnp.all(fin_s | (c_len >= row_step_limit))
+
+                def body_m(state):
+                    c_len, s_cur, r_tok, fin_s, kc, vc = state
+                    active_step = (~fin_s) & (c_len < row_step_limit)
+                    pos_idx = jnp.clip(c_len - 1, 0, cur_cache_len - 1)
+                    x_s = dp["embed_tokens_pad"][r_tok] + dp["embed_pos"][pos_idx]
+                    mask = arange_cur < c_len[:, None, None]
+                    new_kc, new_vc = [], []
+                    for i in range(num_layers):
+                        lp = dp["layers"][i]
+                        ln1 = self._fast_layer_norm(x_s, lp["sa_ln_s"], lp["sa_ln_b"], dtype)
+                        qkv = jnp.einsum("bd,dchk->bchk", ln1, lp["sa_w_qkv_scaled"]) + lp["sa_b_qkv_scaled"][None, ...]
+                        q = qkv[:, 0]
+                        k_cur = jax.vmap(
+                            lambda k_b, kv_b, p_b: lax.dynamic_update_index_in_dim(k_b, kv_b, p_b, axis=0)
+                        )(kc[i], qkv[:, 1], pos_idx)
+                        v_cur = jax.vmap(
+                            lambda v_b, kv_b, p_b: lax.dynamic_update_index_in_dim(v_b, kv_b, p_b, axis=0)
+                        )(vc[i], qkv[:, 2], pos_idx)
+                        new_kc.append(k_cur)
+                        new_vc.append(v_cur)
+                        sa_logits = jnp.einsum("bhd,bshd->bhs", q, k_cur, preferred_element_type=jnp.float32)
+                        sa_logits = jnp.where(mask, sa_logits, jnp.array(-1e9, dtype=jnp.float32))
+                        sa_probs = jax.nn.softmax(sa_logits, axis=-1).astype(dtype)
+                        sa_out = jnp.einsum("bhs,bshd->bhd", sa_probs, v_cur)
+                        x_s = x_s + jnp.einsum("bhd,hde->be", sa_out, lp["sa_w_out"]) + lp["sa_b_out"][None, :]
+
+                        ln2 = self._fast_layer_norm(x_s, lp["ca_ln_s"], lp["ca_ln_b"], dtype)
+                        ca_q = jnp.einsum("bd,dhk->bhk", ln2, lp["ca_w_q_scaled"]) + lp["ca_b_q_scaled"][None, :]
+                        ca_logits = jnp.einsum("bhd,bhds->bhs", ca_q, cross_k[i], preferred_element_type=jnp.float32)
+                        ca_probs = jax.nn.softmax(ca_logits, axis=-1).astype(dtype)
+                        ca_ctx = jnp.einsum("bhs,bhds->bhd", ca_probs, cross_v[i])
+                        x_s = x_s + jnp.einsum("bhd,hde->be", ca_ctx, lp["ca_w_out"]) + lp["ca_b_out"][None, :]
+
+                        ln3 = self._fast_layer_norm(x_s, lp["ffn_ln_s"], lp["ffn_ln_b"], dtype)
+                        ffn = jax.nn.gelu(jnp.dot(ln3, lp["fc1_w"]) + lp["fc1_b"], approximate=False)
+                        x_s = x_s + jnp.dot(ffn, lp["fc2_w"]) + lp["fc2_b"]
+
+                    x_s = self._fast_layer_norm(x_s, dp["ln_scale"], dp["ln_bias"], dtype)
+                    bias = jnp.where((c_len == 1)[:, None], dp["beg_bias"][None, :], dp["sup_bias"][None, :])
+                    logits = jnp.dot(x_s, dp["lm_head_w"]) + bias
+                    pred_tok = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+                    force_idx = jnp.minimum(c_len, 3)
+                    force_tok = jnp.where(c_len < 4, force_arr[batch_iota, force_idx], -1)
+                    raw_next_tok = jnp.where(force_tok >= 0, force_tok, pred_tok)
+                    next_tok = jnp.where(active_step, raw_next_tok, r_tok)
+                    write_pos = jnp.minimum(c_len, max_length - 1)
+                    tok_to_write = jnp.where(active_step, raw_next_tok, s_cur[batch_iota, write_pos])
+                    next_seqs = jax.vmap(
+                        lambda s_b, tok_b, p_b: lax.dynamic_update_index_in_dim(s_b, tok_b, p_b, axis=0)
+                    )(s_cur, tok_to_write, write_pos)
+                    next_c_len = jnp.where(active_step, c_len + 1, c_len)
+                    hit_eos = active_step & (raw_next_tok == eos_tok)
+                    next_fin = fin_s | hit_eos | (next_c_len >= max_length) | is_dummy
+                    return (next_c_len, next_seqs, next_tok, next_fin, new_kc, new_vc)
+
+                c_len_out, seqs_out, _, fin_out, _, _ = lax.while_loop(
+                    cond_m,
+                    body_m,
+                    (cur_len0, seqs0, run_tok0, is_fin0, k_caches, v_caches),
+                )
+                return seqs_out, c_len_out, fin_out
+
+            return _run
+
+        def run_mixed_quantum(_):
+            if max_length <= stage2_cache_len or cache_len == stage2_cache_len:
+                return make_mixed_runner(min(quantum_size - 1, max_length - 1), stage2_cache_len)(None)
+            full_prefill_cap = max(max_length - quantum_size - 1, quantum_size - 1)
+            return lax.cond(
+                jnp.max(cur_len_in) <= quantum_size,
+                make_mixed_runner(quantum_size - 1, stage2_cache_len),
+                make_mixed_runner(full_prefill_cap, cache_len),
+                operand=None,
+            )
+
+        return lax.cond(
+            jnp.any(cur_len_in > 1),
+            run_mixed_quantum,
+            run_pure_new_quantum,
+            operand=None,
+        )
 
     def pipeline_generate(
         self,

@@ -275,9 +275,16 @@ class FlaxWhisperPmapPipeline:
         self.p_generate = jax.pmap(
             generate_fn,
             "input_audio",
+            in_axes=(0, 0, 0, 0, None, None, None),
+            out_axes=0,
+            static_broadcasted_argnums=(4, 5, 6),
+        )
+        self.p_generate_ts = jax.pmap(
+            generate_fn,
+            "input_audio",
             in_axes=(0, 0, 0, None, None, None, None),
             out_axes=0,
-            static_broadcasted_argnums=(3, 4, 5, 6)
+            static_broadcasted_argnums=(3, 4, 5, 6),
         )
         logger.info("Default `pmap` pipeline ready.")
 
@@ -547,8 +554,20 @@ class FlaxWhisperPmapPipeline:
         sharded_audio = shard(input_audio)
         sharded_mask = shard(attention_mask) if attention_mask is not None else None
         
-        # Pass use_tpu_features
-        output_ids = self.p_generate(self.params, sharded_audio, sharded_mask, forced_decoder_ids, return_timestamps, effective_max_length, self.use_tpu_features)
+        if not return_timestamps:
+            B = input_audio.shape[0]
+            force_row = np.full((4,), -1, dtype=np.int32)
+            for idx, tok in forced_decoder_ids:
+                if idx < 4 and tok is not None and tok >= 0:
+                    force_row[idx] = int(tok)
+            sharded_force = shard(np.broadcast_to(force_row[None, :], (B, 4)))
+            output_ids = self.p_generate(
+                self.params, sharded_audio, sharded_mask, sharded_force, False, effective_max_length, self.use_tpu_features
+            )
+        else:
+            output_ids = self.p_generate_ts(
+                self.params, sharded_audio, sharded_mask, forced_decoder_ids, True, effective_max_length, self.use_tpu_features
+            )
         return output_ids.reshape(-1, effective_max_length)
 
     def _result_fetcher_worker(self, return_timestamps=False):
@@ -617,10 +636,14 @@ class FlaxWhisperPmapPipeline:
             if not unpacked_outputs:
                 return {"text": ""}
             if "text" in unpacked_outputs[0]:
-                return {"text": unpacked_outputs[0]["text"]}
+                if len(unpacked_outputs) == 1:
+                    return {"text": unpacked_outputs[0]["text"]}
+                return {"text": " ".join(o["text"].strip() for o in unpacked_outputs if o.get("text", "").strip())}
             batch_token_ids = [output_dict["tokens"].flatten().tolist() for output_dict in unpacked_outputs]
             decoded_texts = self.processor.batch_decode(batch_token_ids, skip_special_tokens=self.skip_special_tokens)
-            return {"text": decoded_texts[0]}
+            if len(decoded_texts) == 1:
+                return {"text": decoded_texts[0]}
+            return {"text": " ".join(t.strip() for t in decoded_texts if t.strip())}
 
     def _partial_postprocess(self, pred_ids, stride):
         out = {"tokens": pred_ids[None, :]}

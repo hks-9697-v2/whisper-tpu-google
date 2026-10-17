@@ -1,6 +1,6 @@
 # Whisper JAX for Google Cloud TPU (v6e & v7x)
 
-This implementation is based on the original [sanchit-gandhi/whisper-jax](https://github.com/sanchit-gandhi/whisper-jax) repository, optimized for **Google Cloud TPU v6e and v7x** with custom Pallas Flash Attention kernels, a fused multi-stage XLA Mega-Decoder, and configurable CPU/TPU Mel-spectrogram preprocessing.
+This implementation is based on the original [sanchit-gandhi/whisper-jax](https://github.com/sanchit-gandhi/whisper-jax) repository, optimized for **Google Cloud TPU v6e and v7x** with custom Pallas Flash Attention kernels, a fused multi-stage XLA Mega-Decoder, continuous batching for online serving, and configurable CPU/TPU Mel-spectrogram preprocessing.
 
 For additional background on the original implementation, see:
 https://medium.com/@engineerbharath/unlocking-supersonic-speech-recognition-a-deep-dive-into-optimizing-whisper-on-tpus-6b8d734993d9
@@ -47,7 +47,7 @@ Top-level module paths (`whisper_jax.pipeline`, `whisper_jax.pipeline_long_audio
 ## Pipeline Architectures
 
 ### 1. Standard Batch Pipeline (`whisper_jax/pipelines/short_audio.py`)
-* **Use Case:** Offline batch transcription of short audio clips (<30s).
+* **Use Case:** Offline batch transcription of short audio clips (<30s), with automatic multi-chunk handling for longer clips.
 * **Logic:** Data-parallel (`jax.pmap`) execution with bucketed batch padding and persistent ring-buffer staging.
 * **Entrypoint:** `benchmarks/libri-short.py`.
 
@@ -58,7 +58,7 @@ Top-level module paths (`whisper_jax.pipeline`, `whisper_jax.pipeline_long_audio
 
 ### 3. Online Serving Pipeline (`whisper_jax/pipelines/online.py`)
 * **Use Case:** Production HTTP API serving (FastAPI).
-* **Logic:** Asynchronous request handling with background audio decoding and dynamic patient batching (`batch_buckets: [4, 40, 80]`).
+* **Logic:** Asynchronous request handling with continuous batching (`batch_buckets: [4, 40, 80]`), early-exit resolution for short requests, co-batching of continuing and newly arrived requests, dynamic per-request language/task batching without XLA recompilation, and automatic multi-chunk handling for long audio.
 * **Entrypoint:** `server/main.py` and `benchmarks/test_api_smart.py`.
 
 ---
