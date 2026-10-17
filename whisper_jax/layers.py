@@ -62,7 +62,7 @@ default_embed_init = nn.initializers.variance_scaling(1.0, "fan_in", "normal", o
 # Temporary inlined JAX N-d initializer code
 # TODO(levskaya): remove once new JAX release is out.
 # ------------------------------------------------------------------------------
-def _compute_fans(shape: jax.core.DShapedArray, in_axis=-2, out_axis=-1):
+def _compute_fans(shape: Any, in_axis=-2, out_axis=-1):
     """Inlined JAX `nn.initializer._compute_fans`."""
     if isinstance(in_axis, int):
         in_size = shape[in_axis]
@@ -78,7 +78,7 @@ def _compute_fans(shape: jax.core.DShapedArray, in_axis=-2, out_axis=-1):
     return fan_in, fan_out
 
 
-def variance_scaling(scale, mode, distribution, in_axis=-2, out_axis=-1, dtype=jnp.float_):
+def variance_scaling(scale, mode, distribution, in_axis=-2, out_axis=-1, dtype=jnp.float32):
     """Inlined JAX `nn.initializer.variance_scaling`."""
 
     def init(key, shape, dtype=dtype):

@@ -29,7 +29,6 @@ from flax import traverse_util
 from flax.linen import partitioning as flax_partitioning
 from jax import numpy as jnp
 from jax import random
-from jax.experimental import multihost_utils
 from jax.experimental.mesh_utils import create_hybrid_device_mesh
 from jax.experimental.pjit import pjit as jax_pjit
 from jax.sharding import Mesh, PartitionSpec

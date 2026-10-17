@@ -1,27 +1,28 @@
-# Copyright 2023 The JAX Authors.
+# Copyright 2025 DeepMind Technologies Limited. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ==============================================================================
 
 """Mini-mask creation library."""
 
-from __future__ import annotations
-
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 import dataclasses
 from typing import Any
+
 import numpy as np
 
 # mypy: ignore-errors
+
 
 class Mask:
   """A base class for splash attention masks."""
@@ -39,14 +40,14 @@ class Mask:
         ' instead of bitwise operations on masks.'
     )
 
-  def __or__(self, other: Mask) -> Mask:
+  def __or__(self, other: 'Mask') -> 'Mask':
     if self.shape != other.shape:
       raise ValueError(
           f'Invalid shape for other: {other.shape}, expected: {self.shape}'
       )
     return LogicalOr(self, other)
 
-  def __and__(self, other: Mask) -> Mask:
+  def __and__(self, other: 'Mask') -> 'Mask':
     if self.shape != other.shape:
       raise ValueError(
           f'Invalid shape for other: {other.shape}, expected: {self.shape}'
@@ -129,7 +130,7 @@ def make_random_mask(
   return np.random.binomial(n=1, p=1.0 - sparsity, size=shape).astype(np.bool_)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class LogicalOr(Mask):
   left: Mask
   right: Mask
@@ -151,7 +152,7 @@ class LogicalOr(Mask):
     return hash((type(self),) + (self.left, self.right))
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class LogicalAnd(Mask):
   left: Mask
   right: Mask
@@ -171,55 +172,6 @@ class LogicalAnd(Mask):
 
   def __hash__(self):
     return hash((type(self),) + (self.left, self.right))
-
-
-@dataclasses.dataclass
-class MultiHeadMask(Mask):
-  """Lazy multihead mask, combines multiple lazy masks one per head."""
-
-  masks: Sequence[Mask]
-
-  def __post_init__(self):
-    if not self.masks:
-      raise ValueError('Unsupported empty tuple of masks')
-
-    shape = self.masks[0].shape
-    for mask in self.masks[1:]:
-      if shape != mask.shape:
-        raise ValueError(
-            f'Unexpected mask shape, got: {mask.shape}, expected: {shape}'
-        )
-
-    if not all(isinstance(mask, Mask) for mask in self.masks):
-      raise ValueError('masks should be of type Mask')
-
-    if any(isinstance(mask, MultiHeadMask) for mask in self.masks):
-      raise ValueError('Nesting MultiHeadMasks is not supported')
-
-  @property
-  def shape(self) -> tuple[int, ...]:
-    return (len(self.masks),) + self.masks[0].shape
-
-  def __getitem__(self, idx) -> np.ndarray:
-    if len(idx) != 3:
-      raise NotImplementedError(f'Unsupported slice: {idx}')
-
-    head_slice = idx[0]
-    if isinstance(head_slice, int):
-      assert head_slice >= 0 and head_slice <= len(self.masks)
-      return self.masks[head_slice][idx[1:]]
-    else:
-      slice_masks = [mask[idx[1:]] for mask in self.masks[head_slice]]
-      return np.stack(slice_masks)
-
-  def __eq__(self, other: object):
-    if not isinstance(other, type(self)):
-      return NotImplemented
-
-    return self.masks == other.masks
-
-  def __hash__(self):
-    return hash((type(self),) + tuple(hash(mask) for mask in self.masks))
 
 
 class _ComputableMask(Mask):
@@ -486,7 +438,7 @@ class LocalMask(_ComputableMask):
     ))
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class NumpyMask(Mask):
   """A mask backed by a dense numpy array."""
 
@@ -525,11 +477,11 @@ def _fill_slice(inp_slice: slice, size: int) -> slice:
   return slice(start, stop, None)
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class FullMask(Mask):
   """Lazy full mask, allows all tokens to attend to all other tokens."""
 
-  # TODO(amagni): Transform FullMask into a _ComputableMask.
+  # TODO(b/447656860): Transform FullMask into a _ComputableMask.
 
   _shape: tuple[int, int]
 
