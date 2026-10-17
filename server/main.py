@@ -6,6 +6,7 @@ import os
 import warnings
 import numpy as np
 import uuid
+from concurrent.futures import Future
 from typing import Optional, AsyncGenerator
 from fastapi import FastAPI, UploadFile, File, Query, HTTPException, status, Request
 import jax
@@ -34,7 +35,7 @@ async def startup_event():
     
     # --- JAX Cache Configuration ---
     try:
-        JAX_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".jax_cache")
+        JAX_CACHE_DIR = os.environ.get("JAX_COMPILATION_CACHE_DIR", os.path.join(os.path.dirname(__file__), ".jax_cache"))
         os.makedirs(JAX_CACHE_DIR, exist_ok=True)
         jax.config.update("jax_compilation_cache_dir", JAX_CACHE_DIR)
         logger.info(f"JAX Cache enabled. Using directory: {JAX_CACHE_DIR}")
@@ -45,7 +46,8 @@ async def startup_event():
     try:
         # Initialize the optimized online pipeline
         # The pipeline performs its own comprehensive warm-up on init
-        pipeline = FlaxWhisperOnlinePipeline("openai/whisper-large-v3-turbo", dtype=jnp.bfloat16)
+        model_id = os.environ.get("WHISPER_MODEL_ID", "openai/whisper-large-v3-turbo")
+        pipeline = FlaxWhisperOnlinePipeline(model_id, dtype=jnp.bfloat16)
         
         is_pipeline_ready = True
         logger.info("✅ Pipeline initialized and warmed up successfully.")
@@ -75,8 +77,8 @@ async def transcribe_stream(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Pipeline is not ready.")
 
     try:
-        request_id = str(uuid.uuid4()) # Generate request_id here
-        future = asyncio.Future() # Create a future to await the result
+        request_id = str(uuid.uuid4())
+        future = Future()
         pipeline.requests[request_id] = {
             "future": future,
             "chunks": [],
@@ -85,17 +87,13 @@ async def transcribe_stream(
             "total_samples": 0
         }
 
-        # Submit the streaming preprocessing task
-        asyncio.create_task(
-            pipeline.process_streaming_request(
-                request_id, 
-                {"language": language, "task": task, "return_timestamps": return_timestamps}, 
-                request.stream() # Pass the async iterator
-            )
-        )
-        
         start_time = time.time()
-        result = await future # Await the completion of this specific request
+        await pipeline.process_streaming_request(
+            request_id,
+            {"language": language, "task": task, "return_timestamps": return_timestamps},
+            request.stream()
+        )
+        result = await asyncio.wrap_future(future)
         end_time = time.time()
 
         pipeline_time = end_time - start_time

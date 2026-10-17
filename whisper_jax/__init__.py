@@ -23,6 +23,8 @@ from .models import FlaxWhisperForConditionalGeneration
 from .pipelines import (
     FlaxWhisperLongAudioPipeline,
     FlaxWhisperOnlinePipeline,
+    FlaxWhisperPipeline,
+    FlaxWhisperPipline,
     FlaxWhisperPjitPipeline,
     FlaxWhisperPmapPipeline,
     create_long_audio_pipeline,

@@ -330,6 +330,22 @@ class FlaxWhisperOnlinePipeline:
         self.preprocess_pool.submit(self._preprocess_request, audio_data, request_id, kwargs)
         return future
 
+    async def process_streaming_request(self, request_id, kwargs, byte_stream):
+        try:
+            chunks = []
+            async for chunk in byte_stream:
+                if chunk:
+                    chunks.append(chunk)
+            audio_data = b"".join(chunks)
+            with self._state_lock:
+                self._active_preprocess_count += 1
+            self.preprocess_pool.submit(self._preprocess_request, audio_data, request_id, kwargs)
+        except Exception as e:
+            logger.error(f"Streaming read failed for {request_id}: {e}")
+            req = self.requests.pop(request_id, None)
+            if req is not None and not req["future"].done():
+                req["future"].set_exception(e)
+
     def _enqueue_waveform(self, waveform, mel_ptr, request_id, kwargs):
         chunk_len_s = common_config.get("chunk_length_s", 30.0)
         stride_len_s = common_config.get("stride_length_s", 5.0)

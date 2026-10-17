@@ -63,7 +63,17 @@ def main(args):
     else:
         console.print(f"[bold red]❌ FAILURE: Expected float32, but got {actual_dtype}.[/bold red]")
 
-    audio_path = "/home/brathinam_google_com/22sept/whisper-on-jax/benchmarks/videoplayback.wav"
+    _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    _candidate_long_files = [
+        os.environ.get("WHISPER_LONG_AUDIO_FILE", ""),
+        "/home/brathinam_google_com/22sept/whisper-on-jax/benchmarks/videoplayback.wav",
+        "/mnt/v7x8-disk/asr_audio_real/benchmarks/videoplayback.wav",
+        os.path.join(_repo_root, "benchmarks", "videoplayback_5min.wav"),
+    ]
+    audio_path = next(
+        (f for f in _candidate_long_files if f and os.path.exists(f) and os.path.getsize(f) > 1024),
+        os.path.join(_repo_root, "benchmarks", "videoplayback_5min.wav"),
+    )
 
     if not os.path.exists(audio_path):
         console.print(f"[bold red]❌ ERROR: Audio file not found at {audio_path}.[/bold red]")
@@ -73,7 +83,7 @@ def main(args):
     
     transcription = pipeline(audio_path)
 
-    output_path = "/home/brathinam_google_com/22sept/whisper-on-jax/benchmarks/validation_transcription.txt"
+    output_path = os.path.join(os.path.dirname(__file__), "validation_transcription.txt")
     with open(output_path, "w") as f:
         f.write(transcription['text'])
     console.print(f"\n[bold green]✅ Transcription successfully written to {output_path}[/bold green]")
@@ -99,7 +109,7 @@ if __name__ == "__main__":
     try:
         from jax import config
         import warnings
-        JAX_CACHE_DIR = "/home/brathinam_google_com/22sept/whisper-on-jax/benchmarks/.jax_cache"
+        JAX_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".jax_cache")
         os.makedirs(JAX_CACHE_DIR, exist_ok=True)
         config.update("jax_compilation_cache_dir", JAX_CACHE_DIR)
         console.print(f"--- JAX Cache enabled. Using directory: {JAX_CACHE_DIR} ---")

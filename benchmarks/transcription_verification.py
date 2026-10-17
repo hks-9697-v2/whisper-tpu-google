@@ -1,3 +1,4 @@
+import os
 import time
 import warnings
 import jax
@@ -17,12 +18,28 @@ BATCH_SIZE = 32 # Internal batch size for chunking within the pipeline
 SAMPLING_RATE = 16000
 MAX_LENGTH = 448
 
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_CANDIDATE_DIRS = [
+    os.environ.get("WHISPER_AUDIO_DIR", ""),
+    "/home/brathinam_google_com/14Oct/whisper-jax-google/asr_audio_new",
+    "/mnt/v7x8-disk/asr_audio_real/asr_audio_new",
+    os.path.join(_REPO_ROOT, "asr_audio_new"),
+]
+_AUDIO_BASE = next(
+    (
+        d for d in _CANDIDATE_DIRS
+        if d and os.path.exists(os.path.join(d, "18s", "medical_domain_test.wav"))
+        and os.path.getsize(os.path.join(d, "18s", "medical_domain_test.wav")) > 1024
+    ),
+    os.path.join(_REPO_ROOT, "asr_audio_new"),
+)
+
 # Define the audio files to test
 AUDIO_FILES = {
-    2: "./asr_audio/2s/good_day.wav",
-    8: "./asr_audio/8s/462_gu.wav",
-    14: "./asr_audio/14s/hindi 15 sec.wav",
-    18: "./asr_audio/18s/medical_domain_test.wav",
+    2: os.path.join(_AUDIO_BASE, "2s", "good_day.wav"),
+    8: os.path.join(_AUDIO_BASE, "8s", "462_gu.wav"),
+    14: os.path.join(_AUDIO_BASE, "14s", "hindi_15_sec.wav"),
+    18: os.path.join(_AUDIO_BASE, "18s", "medical_domain_test.wav"),
 }
 
 def run_transcription_test(pipeline, audio_files_list, test_name="Batch Transcription Test"):

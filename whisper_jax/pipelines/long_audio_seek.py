@@ -47,6 +47,7 @@ from transformers.utils import logging
 
 # ===== Local Imports =====
 from ..models.whisper import FlaxWhisperForConditionalGeneration
+from .online import _HANNING_WINDOW_400, _get_mel_filterbank_T
 
 # ===== Globals =====
 logger = logging.get_logger(__name__)
@@ -172,12 +173,24 @@ class FlaxWhisperPmapPipeline:
 
         self.max_length = max_length if max_length is not None else self.model.generation_config.max_length
         self.min_batch_size = jax.local_device_count()
+        raw_buckets = common_config.get("batch_buckets", [4, 40, 80])
+        self.BATCH_BUCKETS = sorted(list(dict.fromkeys(
+            max(b, self.min_batch_size) if b % self.min_batch_size != 0 else b
+            for b in raw_buckets
+        )))
         self.batch_size = batch_size if batch_size is not None else common_config.get("global_batch_size", self.min_batch_size)
+        if self.batch_size % self.min_batch_size != 0:
+            self.batch_size = max(self.batch_size, self.min_batch_size)
+            if self.batch_size % self.min_batch_size != 0:
+                self.batch_size = ((self.batch_size + self.min_batch_size - 1) // self.min_batch_size) * self.min_batch_size
 
+        loaded_params = FlaxWhisperForConditionalGeneration.prepare_fast_params(
+            loaded_params, self.config, dtype=self.dtype, generation_config=self.model.generation_config
+        )
         # PMAP-specific setup
         self.params = jax_utils.replicate(freeze(loaded_params))
         
-        if not has_flax_weights:
+        if hasattr(self.model, "_params"):
             self.model._params = None
         
         # Manually free memory of the original CPU-loaded params
@@ -548,33 +561,20 @@ class FlaxWhisperPmapPipeline:
 
     @staticmethod
     def _mel_filterbank(sr, n_fft, n_mels, fmin, fmax):
-        def hz_to_mel(freq):
-            return 2595.0 * jnp.log10(1.0 + freq / 700.0)
-        def mel_to_hz(mel):
-            return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
-        mel_min = hz_to_mel(fmin)
-        mel_max = hz_to_mel(fmax)
-        mel_points = jnp.linspace(mel_min, mel_max, n_mels + 2)
-        hz_points = mel_to_hz(mel_points)
-        fft_freqs = jnp.linspace(0, sr / 2, n_fft // 2 + 1)
-        ramps = hz_points[:, None] - fft_freqs[None, :]
-        lower = -ramps[:-2] / (hz_points[1:-1, None] - hz_points[:-2, None])
-        upper = ramps[2:] / (hz_points[2:, None] - hz_points[1:-1, None])
-        fb = jnp.maximum(jnp.zeros_like(lower), jnp.minimum(lower, upper))
-        return fb
+        return jnp.asarray(_get_mel_filterbank_T(sr, n_fft, n_mels).T)
 
     @staticmethod
     def _jax_feature_extractor(waveform, sr, n_fft, hop_length, win_length, n_mels, fmin, fmax, target_feature_length):
-        window = jnp.hanning(win_length)
+        window = jnp.asarray(_HANNING_WINDOW_400) if win_length == 400 else jnp.hanning(win_length)
         stft_matrix = FlaxWhisperPmapPipeline._stft(waveform, n_fft, hop_length, win_length, window)
-        power_spectrogram = jnp.abs(stft_matrix) ** 2
-        mel_filters = FlaxWhisperPmapPipeline._mel_filterbank(sr, n_fft, n_mels, fmin, fmax)
-        mel_spectrogram = jnp.dot(power_spectrogram, mel_filters.T)
+        power_spectrogram = jnp.square(stft_matrix.real) + jnp.square(stft_matrix.imag)
+        mel_filters_T = jnp.asarray(_get_mel_filterbank_T(sr, n_fft, n_mels))
+        mel_spectrogram = jnp.dot(power_spectrogram[:target_feature_length, :], mel_filters_T)
         log_mel_spectrogram = jnp.log10(jnp.maximum(mel_spectrogram, 1e-10))
-        log_mel_spectrogram = (log_mel_spectrogram - jnp.mean(log_mel_spectrogram)) / jnp.sqrt(jnp.var(log_mel_spectrogram) + 1e-7)
-        log_mel_spectrogram = log_mel_spectrogram[:target_feature_length, :]
-        log_mel_spectrogram = log_mel_spectrogram.T
-        return log_mel_spectrogram
+        max_val = jnp.max(log_mel_spectrogram)
+        log_mel_spectrogram = jnp.maximum(log_mel_spectrogram, max_val - 8.0)
+        log_mel_spectrogram = (log_mel_spectrogram + 4.0) * 0.25
+        return log_mel_spectrogram.T
 
 # ===== Factory Function (Step 3) =====
 

@@ -35,8 +35,33 @@ from whisper_jax.pipelines.short_audio import FlaxWhisperPmapPipeline
 
 # --- Configuration ---
 console = Console()
-LONG_AUDIO_FILE = "/home/brathinam_google_com/22sept/whisper-on-jax/benchmarks/videoplayback.wav"
-SHORT_AUDIO_FILE = "/home/brathinam_google_com/22sept/whisper-on-jax/asr_audio/18s/medical_domain_test.wav"
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_CANDIDATE_SHORT_DIRS = [
+    os.environ.get("WHISPER_AUDIO_DIR", ""),
+    "/home/brathinam_google_com/14Oct/whisper-jax-google/asr_audio_new",
+    "/home/brathinam_google_com/22sept/whisper-on-jax/asr_audio",
+    "/mnt/v7x8-disk/asr_audio_real/asr_audio_new",
+    os.path.join(_REPO_ROOT, "asr_audio_new"),
+]
+_SHORT_BASE = next(
+    (
+        d for d in _CANDIDATE_SHORT_DIRS
+        if d and os.path.exists(os.path.join(d, "18s", "medical_domain_test.wav"))
+        and os.path.getsize(os.path.join(d, "18s", "medical_domain_test.wav")) > 1024
+    ),
+    os.path.join(_REPO_ROOT, "asr_audio_new"),
+)
+SHORT_AUDIO_FILE = os.path.join(_SHORT_BASE, "18s", "medical_domain_test.wav")
+_CANDIDATE_LONG_FILES = [
+    os.environ.get("WHISPER_LONG_AUDIO_FILE", ""),
+    "/home/brathinam_google_com/22sept/whisper-on-jax/benchmarks/videoplayback.wav",
+    "/mnt/v7x8-disk/asr_audio_real/benchmarks/videoplayback.wav",
+    os.path.join(_REPO_ROOT, "benchmarks", "videoplayback_5min.wav"),
+]
+LONG_AUDIO_FILE = next(
+    (f for f in _CANDIDATE_LONG_FILES if f and os.path.exists(f) and os.path.getsize(f) > 1024),
+    os.path.join(_REPO_ROOT, "benchmarks", "videoplayback_5min.wav"),
+)
 
 def run_benchmark(pipeline: FlaxWhisperPmapPipeline, model_id: str, root_trace_dir: str):
     """Runs a benchmark for a single long audio file and captures an xprof trace."""

@@ -10,11 +10,26 @@ import subprocess
 
 # --- Configuration ---
 console = Console()
-SERVER_URL = "http://127.0.0.1:8000"
+SERVER_URL = os.environ.get("WHISPER_SERVER_URL", "http://127.0.0.1:8000")
 READY_ENDPOINT = f"{SERVER_URL}/ready"
 TRANSCRIBE_ENDPOINT = f"{SERVER_URL}/transcribe"
-# Define the set of audio files to randomly pick from for each request
-AUDIO_FILE = "/home/brathinam_google_com/14Oct/whisper-on-jax/asr_audio_new/18s/medical_domain_test.wav"
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_CANDIDATE_DIRS = [
+    os.environ.get("WHISPER_AUDIO_DIR", ""),
+    "/home/brathinam_google_com/14Oct/whisper-jax-google/asr_audio_new",
+    "/home/brathinam_google_com/14Oct/whisper-on-jax/asr_audio_new",
+    "/mnt/v7x8-disk/asr_audio_real/asr_audio_new",
+    os.path.join(_REPO_ROOT, "asr_audio_new"),
+]
+_AUDIO_BASE_DIR = next(
+    (
+        d for d in _CANDIDATE_DIRS
+        if d and os.path.exists(os.path.join(d, "18s", "medical_domain_test.wav"))
+        and os.path.getsize(os.path.join(d, "18s", "medical_domain_test.wav")) > 1024
+    ),
+    os.path.join(_REPO_ROOT, "asr_audio_new"),
+)
+AUDIO_FILE = os.path.join(_AUDIO_BASE_DIR, "18s", "medical_domain_test.wav")
 
 def wait_for_server_ready():
     """Polls the /ready endpoint until the server is fully initialized."""

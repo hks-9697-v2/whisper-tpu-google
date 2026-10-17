@@ -39,9 +39,32 @@ console = Console()
 logging.set_verbosity_error()
 
 # --- Audio File Paths ---
-AUDIO_BASE_PATH = "/home/brathinam_google_com/14Oct/whisper-jax-google/asr_audio_new"
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_CANDIDATE_DIRS = [
+    os.environ.get("WHISPER_AUDIO_DIR", ""),
+    "/home/brathinam_google_com/14Oct/whisper-jax-google/asr_audio_new",
+    "/mnt/v7x8-disk/asr_audio_real/asr_audio_new",
+    os.path.join(_REPO_ROOT, "asr_audio_new"),
+]
+AUDIO_BASE_PATH = next(
+    (
+        d for d in _CANDIDATE_DIRS
+        if d and os.path.exists(os.path.join(d, "18s", "medical_domain_test.wav"))
+        and os.path.getsize(os.path.join(d, "18s", "medical_domain_test.wav")) > 1024
+    ),
+    os.path.join(_REPO_ROOT, "asr_audio_new"),
+)
 SHORT_AUDIO_FILE = os.path.join(AUDIO_BASE_PATH, "18s", "medical_domain_test.wav")
-LONG_AUDIO_FILE = "/home/brathinam_google_com/22sept/whisper-on-jax/benchmarks/videoplayback.wav"
+_CANDIDATE_LONG_FILES = [
+    os.environ.get("WHISPER_LONG_AUDIO_FILE", ""),
+    "/home/brathinam_google_com/22sept/whisper-on-jax/benchmarks/videoplayback.wav",
+    "/mnt/v7x8-disk/asr_audio_real/benchmarks/videoplayback.wav",
+    os.path.join(_REPO_ROOT, "benchmarks", "videoplayback_5min.wav"),
+]
+LONG_AUDIO_FILE = next(
+    (f for f in _CANDIDATE_LONG_FILES if f and os.path.exists(f) and os.path.getsize(f) > 1024),
+    os.path.join(_REPO_ROOT, "benchmarks", "videoplayback_5min.wav"),
+)
 
 def run_long_file_benchmark(pipeline, concurrency: int):
     """Tests the pipeline processing for a single long audio file with a given concurrency."""

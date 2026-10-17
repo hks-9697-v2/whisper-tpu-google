@@ -15,10 +15,25 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
 
 # --- Configuration ---
 console = Console()
-SERVER_URL = "http://127.0.0.1:8000"
+SERVER_URL = os.environ.get("WHISPER_SERVER_URL", "http://127.0.0.1:8000")
 READY_ENDPOINT = f"{SERVER_URL}/ready"
 TRANSCRIBE_ENDPOINT = f"{SERVER_URL}/transcribe"
-AUDIO_BASE_DIR = "/home/brathinam_google_com/14Oct/whisper-on-jax/asr_audio_new"
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_CANDIDATE_DIRS = [
+    os.environ.get("WHISPER_AUDIO_DIR", ""),
+    "/home/brathinam_google_com/14Oct/whisper-jax-google/asr_audio_new",
+    "/home/brathinam_google_com/14Oct/whisper-on-jax/asr_audio_new",
+    "/mnt/v7x8-disk/asr_audio_real/asr_audio_new",
+    os.path.join(_REPO_ROOT, "asr_audio_new"),
+]
+AUDIO_BASE_DIR = next(
+    (
+        d for d in _CANDIDATE_DIRS
+        if d and os.path.exists(os.path.join(d, "18s", "medical_domain_test.wav"))
+        and os.path.getsize(os.path.join(d, "18s", "medical_domain_test.wav")) > 1024
+    ),
+    os.path.join(_REPO_ROOT, "asr_audio_new"),
+)
 
 # Audio file to test (Hardcoded to 18s for this test)
 AUDIO_TEST_SET = [
@@ -110,7 +125,9 @@ def transcribe_worker(stats_ref, request_idx, speed=1.0):
             console.print(f"[red]Request failed: {e}[/red]")
         return None
 
-def run_simultaneous_benchmark(total_requests, speed):
+def run_simultaneous_benchmark(total_requests, speed, concurrency=None):
+    if concurrency is None or concurrency <= 0:
+        concurrency = total_requests
     current_stats = {
         "successful": 0,
         "failed": 0,
@@ -120,14 +137,11 @@ def run_simultaneous_benchmark(total_requests, speed):
         "lock": threading.Lock()
     }
 
-    console.print(f"\n[bold blue]🚀 Launching {total_requests} Simultaneous Requests (Speed: {speed}x)[/bold blue]")
-    
-    # We use max_workers = total_requests to ensure TRUE simultaneous dispatch
-    # This creates 1280 threads. Python can handle this IO-bound workload.
+    console.print(f"\n[bold blue]🚀 Launching {total_requests} Requests (Concurrency: {concurrency}, Speed: {speed}x)[/bold blue]")
     
     start_time = time.time()
 
-    with ThreadPoolExecutor(max_workers=total_requests) as executor:
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = []
         # Dispatch all
         for i in range(total_requests):
@@ -178,10 +192,11 @@ def print_results(wall_time, total_requests, stats_data):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-n", "--total", type=int, default=1280, help="Total requests (simultaneous)")
+    parser.add_argument("-c", "--concurrency", type=int, default=None, help="Concurrency level (defaults to --total)")
     parser.add_argument("--speed", type=float, default=1.0, help="Audio speed factor")
     args = parser.parse_args()
 
     wait_for_server_ready()
     load_audio_files()
     
-    run_simultaneous_benchmark(args.total, args.speed)
+    run_simultaneous_benchmark(args.total, args.speed, args.concurrency)
